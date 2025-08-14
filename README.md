@@ -10,19 +10,34 @@ Code to test and benchmark the performance of cryptographic libraries providing 
 
 **Implementations**
 
-OpenMLS - Rust implementation of the MLS protocol. 
-  - My repo: https://github.com/RochP-Lab/MLS-OpenMLS
-  - messagingbatch.rs allows testing of multiple ciphersuites and message sizes, with various performance metrics recorded.
+MLS - OpenMLS - Rust implementation of the MLS protocol. 
+  - 
 
-mlspp - C++ implementation of the MLS protocol. 
-  - My repo: https://github.com/RochP-Lab/MLS-mlspp
+MLS - MLSpp - C++ implementation of the MLS protocol. 
+  - 
   - main.cpp and CMakeLists.txt compile to produce benchmark_runner, this tests multiple ciphersuites and messages sizes, with various performance metrics recorded.
 
-Kryptology - Golang implementation of FROST signatures using Ed25519 curve. 
-  - My repo: -  https://github.com/RochP-Lab/DKG-Kryptology
+FROST - Kryptology - Golang implementation of FROST signatures using Ed25519 and secp256k1 curves. 
+-  
   - main.go - Code to benchmark preformance of library
   - ???. Code to prove test libraries BFT
 
-Bank Italia - C implementation of FROST signatures using secp256k1 curve.
-  - My repo: https://github.com/RochP-Lab/DKG-BankItalia
+FROST - Bank Italia - C implementation of FROST signatures using secp256k1 curve.
+- 
+  - DKG and trusted dealer benchmarks.
+ 
+
+FROST - Zcash Foundation - Rust implementation of FROST signatures using Ed25519 curve.
+- 
+
+BLS - BLSTRS - Rust implementation of BLS signatures using BLS... curv
+- DKG implementation
+
+Herumi - BLS - C++ implementation of BLS signatures
+- Trusted dealer implementation
+
+
+
+
+
 
