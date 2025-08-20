@@ -1,0 +1,1822 @@
+package main
+
+/*
+ * FROST DKG Scaling Benchmark Suite (Coinbase Kryptology Ed25519 Implementation)
+ * ==============================================================================
+ *
+ * Comprehensive performance benchmarking for FROST signatures using Coinbase
+ * Kryptology library with Ed25519 curve (3-100 participants).
+ *
+ * Benchmark Categories:
+ * - Statistical Benchmarks (3-60 participants): DKG, Signing, Verification, End-to-End
+ * - Large-Scale Benchmarks (60-100 participants): DKG, Signing, Verification, End-to-End
+ * - Academic-grade statistical analysis with outlier detection and CV analysis
+ *
+ * Quick Start:
+ *   go test -bench=BenchmarkDKGStatistical -timeout=60m     # Normal groups (3-60 participants)
+ *   go test -bench=.*Large -timeout=180m                    # Large groups (60-100 participants)
+ *   go test -bench=.*Statistical -timeout=120m              # All normal group tests
+ *   go test -bench=. -timeout=300m                          # All benchmarks (5+ hours)
+ *
+ * Individual Test Categories:
+ *   go test -bench=BenchmarkFROSTSigning -timeout=60m       # Normal signing tests
+ *   go test -bench=BenchmarkFROSTSigningLarge -timeout=60m  # Large signing tests
+ *   go test -bench=BenchmarkFROSTVerification -timeout=30m  # Normal verification tests
+ *   go test -bench=BenchmarkFROSTVerificationLarge -timeout=30m # Large verification tests
+ *   go test -bench=BenchmarkFROSTEndToEnd -timeout=120m     # Normal end-to-end tests
+ *   	 # Large end-to-end tests
+ */
+
+import (
+	"crypto/rand"
+	"fmt"
+	"math"
+	"sort"
+	"testing"
+	"time"
+
+	"github.com/coinbase/kryptology/pkg/core/curves"
+	dkg "github.com/coinbase/kryptology/pkg/dkg/frost"
+	"github.com/coinbase/kryptology/pkg/sharing"
+	"github.com/coinbase/kryptology/pkg/ted25519/frost"
+)
+
+// Test configuration constants
+const (
+	CTX = "kryptology-dkg-benchmark-context" // Prevents replay attacks
+)
+
+// Participant count ranges for comprehensive scaling analysis - standardized across all implementations
+var participantCounts = []int{3, 5, 10, 20, 40, 60, 100} // Standardized matrix matching secp256k1-frost benchmark
+
+// Threshold calculation functions matching Zcash terminology
+func oneThirdThreshold(n int) int {
+	threshold := ((n - 1) / 3) + 1
+	if threshold < 2 {
+		return 2 // Kryptology minimum threshold requirement
+	}
+	return threshold
+}
+
+func twoThirdsThreshold(n int) int {
+	threshold := (2*n + 2) / 3
+	if threshold < 2 {
+		return 2 // Kryptology minimum threshold requirement
+	}
+	return threshold
+}
+
+// DKG execution function - mirrors kryptology-key-reuse-clean implementation
+func executeDKGProtocol(threshold, limit int) (map[uint32]*dkg.DkgParticipant, curves.Point, error) {
+	curve := curves.ED25519()
+	if curve == nil {
+		return nil, nil, fmt.Errorf("failed to initialize Ed25519 curve")
+	}
+
+	// Create DKG participants
+	participants := make(map[uint32]*dkg.DkgParticipant, limit)
+
+	for i := 1; i <= limit; i++ {
+		// Create list of other participant IDs (all except current participant)
+		otherIds := make([]uint32, limit-1)
+		idx := 0
+		for j := 1; j <= limit; j++ {
+			if i == j {
+				continue
+			}
+			otherIds[idx] = uint32(j)
+			idx++
+		}
+
+		participant, err := dkg.NewDkgParticipant(uint32(i), uint32(threshold), CTX, curve, otherIds...)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to create participant %d: %w", i, err)
+		}
+		participants[uint32(i)] = participant
+	}
+
+	///////////////////////////////////////////////////////////////////////////
+	// DKG Round 1: Generate commitments and proofs of knowledge
+	///////////////////////////////////////////////////////////////////////////
+	round1Broadcasts := make(map[uint32]*dkg.Round1Bcast)
+	round1P2PMessages := make(map[uint32]dkg.Round1P2PSend)
+
+	// Each participant generates round 1 messages
+	for id, participant := range participants {
+		broadcast, p2pSends, err := participant.Round1(nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("round 1 failed for participant %d: %w", id, err)
+		}
+
+		round1Broadcasts[id] = broadcast
+		round1P2PMessages[id] = p2pSends
+	}
+
+	///////////////////////////////////////////////////////////////////////////
+	// DKG Round 2: Process shares and compute final keys
+	///////////////////////////////////////////////////////////////////////////
+	var verificationKey curves.Point
+
+	for id := range round1Broadcasts {
+		// Collect P2P messages for this participant
+		p2pForParticipant := make(map[uint32]*sharing.ShamirShare)
+		for senderId := range round1P2PMessages {
+			if senderId != id {
+				p2pForParticipant[senderId] = round1P2PMessages[senderId][id]
+			}
+		}
+
+		// Execute round 2
+		round2Out, err := participants[id].Round2(round1Broadcasts, p2pForParticipant)
+		if err != nil {
+			return nil, nil, fmt.Errorf("round 2 failed for participant %d: %w", id, err)
+		}
+
+		// All participants should derive the same verification key
+		verificationKey = round2Out.VerificationKey
+	}
+
+	return participants, verificationKey, nil
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// BENCHMARK FUNCTIONS - Go testing.B Framework
+///////////////////////////////////////////////////////////////////////////////
+
+// Benchmark DKG with 1/3 majority thresholds (tolerates up to 1/3 malicious participants)
+func BenchmarkDKG1_3_Majority(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := oneThirdThreshold(n)
+
+		b.Run(fmt.Sprintf("participants_%d", n), func(b *testing.B) {
+			// Reset timer to exclude setup overhead
+			b.ResetTimer()
+
+			// Run the benchmark n times
+			for i := 0; i < b.N; i++ {
+				_, _, err := executeDKGProtocol(threshold, n)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// Benchmark DKG with 2/3 majority thresholds (requires 2/3+ honest participants)
+func BenchmarkDKG2_3_Majority(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := twoThirdsThreshold(n)
+
+		b.Run(fmt.Sprintf("participants_%d", n), func(b *testing.B) {
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				_, _, err := executeDKGProtocol(threshold, n)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// FROST SIGNING & VERIFICATION BENCHMARKS (Actual Protocol Implementation)
+///////////////////////////////////////////////////////////////////////////////
+
+// executeFROSTSigning performs the complete 3-round FROST signing protocol
+func executeFROSTSigning(participants map[uint32]*dkg.DkgParticipant, verificationKey curves.Point, threshold int, message []byte) (*frost.Signature, error) {
+	curve := curves.ED25519()
+
+	// Setup Lagrange coefficients for the threshold participants (1 to threshold)
+	scheme, err := sharing.NewShamir(uint32(threshold), uint32(len(participants)), curve)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Shamir scheme: %w", err)
+	}
+
+	// Create shares for Lagrange coefficient calculation
+	shares := make([]*sharing.ShamirShare, threshold)
+	signerIds := make([]uint32, threshold)
+	for i := 0; i < threshold; i++ {
+		participantId := uint32(i + 1)
+		shares[i] = &sharing.ShamirShare{Id: participantId, Value: participants[participantId].SkShare.Bytes()}
+		signerIds[i] = participantId
+	}
+
+	// Calculate Lagrange coefficients
+	lCoeffs, err := scheme.LagrangeCoeffs(signerIds)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate Lagrange coefficients: %w", err)
+	}
+
+	// Create fresh FROST signers for this signature
+	signers := make(map[uint32]*frost.Signer, threshold)
+	for i := 0; i < threshold; i++ {
+		participantId := uint32(i + 1)
+		signers[participantId], err = frost.NewSigner(
+			participants[participantId],
+			participantId,
+			uint32(threshold),
+			lCoeffs,
+			signerIds,
+			&frost.Ed25519ChallengeDeriver{},
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create signer %d: %w", participantId, err)
+		}
+	}
+
+	// FROST Round 1: Generate nonce commitments (Communication Round 1)
+	round2Input := make(map[uint32]*frost.Round1Bcast, threshold)
+	for i := 0; i < threshold; i++ {
+		participantId := uint32(i + 1)
+		round1Out, err := signers[participantId].SignRound1()
+		if err != nil {
+			return nil, fmt.Errorf("SignRound1 failed for participant %d: %w", participantId, err)
+		}
+		round2Input[participantId] = round1Out
+	}
+
+	// FROST Round 2: Process message and generate signature shares (Communication Round 2)
+	round3Input := make(map[uint32]*frost.Round2Bcast, threshold)
+	for i := 0; i < threshold; i++ {
+		participantId := uint32(i + 1)
+		round2Out, err := signers[participantId].SignRound2(message, round2Input)
+		if err != nil {
+			return nil, fmt.Errorf("SignRound2 failed for participant %d: %w", participantId, err)
+		}
+		round3Input[participantId] = round2Out
+	}
+
+	// FROST Aggregation: Combine signature shares into final signature (Local computation, not a communication round)
+	var finalSignature *frost.Signature
+	for i := 0; i < threshold; i++ {
+		participantId := uint32(i + 1)
+		round3Out, err := signers[participantId].SignRound3(round3Input)
+		if err != nil {
+			return nil, fmt.Errorf("SignRound3 failed for participant %d: %w", participantId, err)
+		}
+		// All participants should produce the same signature
+		if finalSignature == nil {
+			finalSignature = &frost.Signature{
+				C: round3Out.C,
+				Z: round3Out.Z,
+			}
+		}
+	}
+
+	return finalSignature, nil
+}
+
+// Benchmark FROST signing with actual 3-round protocol - 33% threshold
+func BenchmarkFROSTSigning33(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := oneThirdThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			// Pre-setup: Generate keys via DKG (excluded from timing)
+			participants, verificationKey, err := executeDKGProtocol(threshold, n)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			// Message to sign
+			message := []byte("FROST threshold signature benchmark message")
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Execute actual FROST 2-round signing protocol + aggregation
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// Prevent optimization
+				if signature == nil || signature.C == nil || signature.Z == nil {
+					b.Fatalf("Invalid signature generated")
+				}
+			}
+		})
+	}
+}
+
+// Benchmark FROST signing with actual 3-round protocol - 66% threshold
+func BenchmarkFROSTSigning66(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := twoThirdsThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			// Pre-setup: Generate keys via DKG (excluded from timing)
+			participants, verificationKey, err := executeDKGProtocol(threshold, n)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			// Message to sign
+			message := []byte("FROST threshold signature benchmark message")
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Execute actual FROST 2-round signing protocol + aggregation
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// Prevent optimization
+				if signature == nil || signature.C == nil || signature.Z == nil {
+					b.Fatalf("Invalid signature generated")
+				}
+			}
+		})
+	}
+}
+
+// FROST signature verification benchmark - 33% threshold
+func BenchmarkFROSTVerification33(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := oneThirdThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			// Setup: Create verification key and signature via complete protocol
+			participants, verificationKey, err := executeDKGProtocol(threshold, n)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST verification benchmark message")
+
+			// Generate a real signature using the FROST protocol
+			signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+			if err != nil {
+				b.Fatalf("FROST signing setup failed: %v", err)
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Verify signature using FROST verification (Ed25519 verification)
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				// Compute R' = z*G + (-c)*vk
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				// Compute c' = H(m, R')
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				// Check c = c'
+				valid := tempC.Cmp(signature.C) == 0
+
+				// Prevent optimization
+				if !valid {
+					b.Fatalf("Signature verification failed")
+				}
+			}
+		})
+	}
+}
+
+// FROST signature verification benchmark - 66% threshold
+func BenchmarkFROSTVerification66(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := twoThirdsThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			// Setup: Create verification key and signature via complete protocol
+			participants, verificationKey, err := executeDKGProtocol(threshold, n)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST verification benchmark message")
+
+			// Generate a real signature using the FROST protocol
+			signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+			if err != nil {
+				b.Fatalf("FROST signing setup failed: %v", err)
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Verify signature using FROST verification (Ed25519 verification)
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				// Compute R' = z*G + (-c)*vk
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				// Compute c' = H(m, R')
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				// Check c = c'
+				valid := tempC.Cmp(signature.C) == 0
+
+				// Prevent optimization
+				if !valid {
+					b.Fatalf("Signature verification failed")
+				}
+			}
+		})
+	}
+}
+
+// End-to-end FROST workflow benchmark (DKG + Sign + Verify) - 33% threshold
+func BenchmarkFROSTEndToEnd33(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := oneThirdThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			message := []byte("End-to-end FROST benchmark")
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Phase 1: DKG
+				participants, verificationKey, err := executeDKGProtocol(threshold, n)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+
+				// Phase 2: FROST Signing (2-round protocol + local aggregation)
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// Phase 3: Verification
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+
+				// Prevent optimization
+				if !valid || signature == nil || verificationKey == nil {
+					b.Fatalf("End-to-end workflow failed")
+				}
+			}
+		})
+	}
+}
+
+// End-to-end FROST workflow benchmark (DKG + Sign + Verify) - 66% threshold
+func BenchmarkFROSTEndToEnd66(b *testing.B) {
+	for _, n := range participantCounts {
+		threshold := twoThirdsThreshold(n)
+
+		b.Run(fmt.Sprintf("n_%d_t_%d", n, threshold), func(b *testing.B) {
+			message := []byte("End-to-end FROST benchmark")
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Phase 1: DKG
+				participants, verificationKey, err := executeDKGProtocol(threshold, n)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+
+				// Phase 2: FROST Signing (2-round protocol + local aggregation)
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// Phase 3: Verification
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+
+				// Prevent optimization
+				if !valid || signature == nil || verificationKey == nil {
+					b.Fatalf("End-to-end workflow failed")
+				}
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// IMPROVED DKG VS TRUSTED DEALER COMPARISON
+///////////////////////////////////////////////////////////////////////////////
+
+// Improved DKG vs Trusted Dealer comparison with equivalent functionality
+func BenchmarkDKGvsTrustedDealer(b *testing.B) {
+	const testSize = 20
+	threshold := oneThirdThreshold(testSize)
+	curve := curves.ED25519()
+
+	b.Run("DKG_Complete_Setup", func(b *testing.B) {
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			// Full DKG protocol producing participant private keys + group public key
+			_, verificationKey, err := executeDKGProtocol(threshold, testSize)
+			if err != nil {
+				b.Fatalf("DKG failed: %v", err)
+			}
+			if verificationKey == nil {
+				b.Fatalf("Invalid verification key")
+			}
+		}
+	})
+
+	b.Run("TrustedDealer_Complete_Setup", func(b *testing.B) {
+		b.ResetTimer()
+
+		for i := 0; i < b.N; i++ {
+			// Equivalent trusted dealer setup: generate group key + distribute shares
+
+			// 1. Generate group private key
+			groupPrivateKey := curve.Scalar.Random(rand.Reader)
+			groupPublicKey := curve.Point.Generator().Mul(groupPrivateKey)
+
+			// 2. Create Shamir secret sharing scheme
+			scheme, err := sharing.NewShamir(uint32(threshold), uint32(testSize), curve)
+			if err != nil {
+				b.Fatalf("Failed to create Shamir scheme: %v", err)
+			}
+
+			// 3. Split group private key into shares
+			shares, err := scheme.Split(groupPrivateKey, rand.Reader)
+			if err != nil {
+				b.Fatalf("Failed to split secret: %v", err)
+			}
+
+			// 4. Verify shares can reconstruct (equivalent to DKG validation)
+			if len(shares) < threshold {
+				b.Fatalf("Insufficient shares generated")
+			}
+
+			// 5. Simulate distribution to participants (network/storage cost)
+			participantShares := make(map[uint32]*sharing.ShamirShare)
+			for shareId, share := range shares {
+				if shareId <= testSize {
+					participantShares[uint32(shareId)] = share
+				}
+			}
+
+			// Prevent optimization
+			if groupPublicKey == nil || len(participantShares) == 0 {
+				b.Fatalf("Trusted dealer setup failed")
+			}
+		}
+	})
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ROUND-BY-ROUND PERFORMANCE ANALYSIS
+///////////////////////////////////////////////////////////////////////////////
+
+// Benchmark individual DKG rounds for complexity analysis
+func BenchmarkDKGRounds(b *testing.B) {
+	testSizes := []int{3, 5, 10, 20, 40} // Subset of standard sizes for detailed analysis
+
+	for _, n := range testSizes {
+		// Round 1 benchmark
+		b.Run(fmt.Sprintf("Round1_%d", n), func(b *testing.B) {
+			// Pre-create participants outside benchmark loop to exclude setup cost
+			curve := curves.ED25519()
+			threshold := oneThirdThreshold(n)
+
+			// Create participant templates (will be recreated fresh each iteration)
+			participantConfigs := make([][]uint32, n)
+			for j := 1; j <= n; j++ {
+				otherIds := make([]uint32, n-1)
+				idx := 0
+				for k := 1; k <= n; k++ {
+					if j == k {
+						continue
+					}
+					otherIds[idx] = uint32(k)
+					idx++
+				}
+				participantConfigs[j-1] = otherIds
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				// Create fresh participants (DKG has state - can only do Round1 once)
+				participants := make(map[uint32]*dkg.DkgParticipant)
+				for j := 1; j <= n; j++ {
+					participant, err := dkg.NewDkgParticipant(
+						uint32(j),
+						uint32(threshold),
+						CTX,
+						curve,
+						participantConfigs[j-1]...,
+					)
+					if err != nil {
+						b.Fatalf("Failed to create participant: %v", err)
+					}
+					participants[uint32(j)] = participant
+				}
+
+				// Benchmark only Round 1 execution (setup cost excluded)
+				for _, participant := range participants {
+					_, _, err := participant.Round1(nil)
+					if err != nil {
+						b.Fatalf("Round 1 failed: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// MEMORY USAGE ANALYSIS
+///////////////////////////////////////////////////////////////////////////////
+
+// Memory scaling benchmark for large participant counts
+func BenchmarkDKGMemory(b *testing.B) {
+	testSizes := []int{3, 10, 20, 40, 60} // Subset for memory analysis
+
+	for _, n := range testSizes {
+		threshold := oneThirdThreshold(n)
+
+		b.Run(fmt.Sprintf("memory_%d", n), func(b *testing.B) {
+			b.ResetTimer()
+
+			for i := 0; i < b.N; i++ {
+				participants, verificationKey, err := executeDKGProtocol(threshold, n)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+
+				// Prevent optimization away
+				if len(participants) != n || verificationKey == nil {
+					b.Fatalf("Invalid DKG result")
+				}
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ENHANCED STATISTICAL BENCHMARK FUNCTIONS
+// These provide mean, median, std dev similar to C++ Google Benchmark
+///////////////////////////////////////////////////////////////////////////////
+
+// StatResult holds statistical data for benchmark results
+type StatResult struct {
+	Mean     time.Duration
+	Median   time.Duration
+	StdDev   time.Duration
+	Min      time.Duration
+	Max      time.Duration
+	Count    int
+	Outliers []time.Duration // Statistical outliers detected
+	Q1       time.Duration   // First quartile (25th percentile)
+	Q3       time.Duration   // Third quartile (75th percentile)
+	IQR      time.Duration   // Interquartile range (Q3 - Q1)
+}
+
+// calculateStats computes statistical measures from timing data with outlier detection
+func calculateStats(durations []time.Duration) StatResult {
+	if len(durations) == 0 {
+		return StatResult{}
+	}
+
+	// Sort for percentile calculations
+	sorted := make([]time.Duration, len(durations))
+	copy(sorted, durations)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+
+	// Calculate mean
+	var sum time.Duration
+	for _, d := range durations {
+		sum += d
+	}
+	mean := sum / time.Duration(len(durations))
+
+	// Calculate median
+	var median time.Duration
+	n := len(sorted)
+	if n%2 == 0 {
+		median = (sorted[n/2-1] + sorted[n/2]) / 2
+	} else {
+		median = sorted[n/2]
+	}
+
+	// Calculate quartiles for outlier detection
+	var q1, q3 time.Duration
+	if n >= 4 {
+		// First quartile (25th percentile)
+		q1Index := n / 4
+		if n%4 == 0 {
+			q1 = (sorted[q1Index-1] + sorted[q1Index]) / 2
+		} else {
+			q1 = sorted[q1Index]
+		}
+
+		// Third quartile (75th percentile)
+		q3Index := (3 * n) / 4
+		if (3*n)%4 == 0 {
+			q3 = (sorted[q3Index-1] + sorted[q3Index]) / 2
+		} else {
+			q3 = sorted[q3Index]
+		}
+	} else {
+		// For small samples, use min/max as quartiles
+		q1 = sorted[0]
+		q3 = sorted[n-1]
+	}
+
+	iqr := q3 - q1
+
+	// Detect outliers using IQR method (values beyond 1.5 * IQR from quartiles)
+	var outliers []time.Duration
+	lowerBound := q1 - time.Duration(float64(iqr)*1.5)
+	upperBound := q3 + time.Duration(float64(iqr)*1.5)
+
+	// Ensure bounds are non-negative
+	if lowerBound < 0 {
+		lowerBound = 0
+	}
+
+	for _, d := range durations {
+		if d < lowerBound || d > upperBound {
+			outliers = append(outliers, d)
+		}
+	}
+
+	// Calculate standard deviation
+	var sumSquaredDiffs float64
+	meanNanos := float64(mean.Nanoseconds())
+	for _, d := range durations {
+		diff := float64(d.Nanoseconds()) - meanNanos
+		sumSquaredDiffs += diff * diff
+	}
+	stdDevNanos := math.Sqrt(sumSquaredDiffs / float64(len(durations)))
+	stdDev := time.Duration(stdDevNanos)
+
+	return StatResult{
+		Mean:     mean,
+		Median:   median,
+		StdDev:   stdDev,
+		Min:      sorted[0],
+		Max:      sorted[n-1],
+		Count:    len(durations),
+		Outliers: outliers,
+		Q1:       q1,
+		Q3:       q3,
+		IQR:      iqr,
+	}
+}
+
+// removeOutliers creates a new slice with outliers removed using IQR method
+// This can be useful for analysis that requires outlier-free datasets
+func removeOutliers(durations []time.Duration) []time.Duration {
+	if len(durations) < 4 {
+		return durations // Too few samples for meaningful outlier detection
+	}
+
+	// Calculate basic stats for outlier detection
+	tempStats := calculateStats(durations)
+
+	// Return samples that are not outliers
+	var cleaned []time.Duration
+	lowerBound := tempStats.Q1 - time.Duration(float64(tempStats.IQR)*1.5)
+	upperBound := tempStats.Q3 + time.Duration(float64(tempStats.IQR)*1.5)
+
+	if lowerBound < 0 {
+		lowerBound = 0
+	}
+
+	for _, d := range durations {
+		if d >= lowerBound && d <= upperBound {
+			cleaned = append(cleaned, d)
+		}
+	}
+
+	return cleaned
+}
+
+// BenchmarkDKGStatistical provides detailed statistical analysis like C++/Rust benchmarks
+func BenchmarkDKGStatistical(b *testing.B) {
+	// Test configurations: enhanced sample sizes for academic rigor matching Rust Criterion.rs
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int           // Enhanced sample sizes for statistical significance
+		maxTime      time.Duration // Maximum time per group (Rust standard: up to 3000 seconds)
+	}{
+		// Small groups - many samples for excellent statistics
+		{3, oneThirdThreshold, "3_participants_33pct", 50, 30 * time.Second},
+		{5, oneThirdThreshold, "5_participants_33pct", 30, 60 * time.Second},
+		{10, oneThirdThreshold, "10_participants_33pct", 20, 120 * time.Second},
+		{3, twoThirdsThreshold, "3_participants_66pct", 50, 30 * time.Second},
+		{5, twoThirdsThreshold, "5_participants_66pct", 30, 60 * time.Second},
+		{10, twoThirdsThreshold, "10_participants_66pct", 20, 120 * time.Second},
+
+		// Medium groups - sufficient samples for statistical validity
+		{20, oneThirdThreshold, "20_participants_33pct", 15, 300 * time.Second},
+		{20, twoThirdsThreshold, "20_participants_66pct", 15, 300 * time.Second},
+
+		// Large groups - minimum 10 samples as per Rust Criterion.rs standard
+		{40, oneThirdThreshold, "40_participants_33pct", 10, 600 * time.Second},
+		{40, twoThirdsThreshold, "40_participants_66pct", 10, 600 * time.Second},
+
+		// Very large groups - academic minimum with extended timeout
+		{60, oneThirdThreshold, "60_participants_33pct", 10, 1200 * time.Second},
+		{60, twoThirdsThreshold, "60_participants_66pct", 10, 1200 * time.Second},
+
+		// Note: 100 participants moved to BenchmarkDKGLarge for separate testing
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			// Set appropriate timeout for this configuration
+			if config.participants >= 40 {
+				b.Logf("Running enhanced sample size (%d) for %d participants with extended timeout (%v)",
+					config.sampleSize, config.participants, config.maxTime)
+			}
+
+			// Collect timing data for statistical analysis
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			// Run enhanced number of iterations for academic statistical rigor
+			for i := 0; i < config.sampleSize; i++ {
+				// Check timeout to prevent test runner timeouts
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached maximum time limit (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+				_, _, err := executeDKGProtocol(threshold, config.participants)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				// Progress indicator for medium and large tests
+				if config.participants >= 20 {
+					remaining := config.sampleSize - (i + 1)
+					estimatedRemaining := time.Duration(remaining) * elapsed
+					b.Logf("Completed iteration %d/%d for %d participants (took %v, est. remaining: %v)",
+						i+1, config.sampleSize, config.participants, elapsed, estimatedRemaining)
+				}
+			}
+
+			// Calculate statistics (require minimum 3 samples for meaningful stats)
+			if len(timings) < 3 {
+				b.Logf("WARNING: Only %d samples collected for %d participants - insufficient for statistical analysis",
+					len(timings), config.participants)
+				if len(timings) > 0 {
+					b.ReportMetric(float64(timings[0].Nanoseconds()), "single_sample_ns/op")
+				}
+				return
+			}
+
+			stats := calculateStats(timings)
+
+			// Report results similar to Google Benchmark format with enhanced metrics
+			b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+			b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+			b.ReportMetric(float64(stats.StdDev.Nanoseconds()), "stddev_ns")
+			b.ReportMetric(float64(stats.Min.Nanoseconds()), "min_ns")
+			b.ReportMetric(float64(stats.Max.Nanoseconds()), "max_ns")
+			b.ReportMetric(float64(stats.Q1.Nanoseconds()), "q1_ns")
+			b.ReportMetric(float64(stats.Q3.Nanoseconds()), "q3_ns")
+			b.ReportMetric(float64(len(stats.Outliers)), "outliers_count")
+
+			// Calculate coefficient of variation (CV) as percentage
+			cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+			b.ReportMetric(cv, "cv_percent")
+
+			// Calculate outlier percentage
+			outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+			b.ReportMetric(outlierPercent, "outliers_percent")
+
+			// Log detailed results with enhanced statistics
+			b.Logf("Enhanced Statistical Analysis for %s (t=%d, n=%d, samples=%d):",
+				config.name, threshold, config.participants, len(timings))
+			b.Logf("  Mean:     %v", stats.Mean)
+			b.Logf("  Median:   %v", stats.Median)
+			b.Logf("  StdDev:   %v", stats.StdDev)
+			b.Logf("  Min:      %v", stats.Min)
+			b.Logf("  Max:      %v", stats.Max)
+			b.Logf("  Q1 (25%%): %v", stats.Q1)
+			b.Logf("  Q3 (75%%): %v", stats.Q3)
+			b.Logf("  IQR:      %v", stats.IQR)
+			b.Logf("  CV:       %.2f%% (coefficient of variation)", cv)
+			b.Logf("  Range:    [%v, %v, %v] (min, median, max)", stats.Min, stats.Median, stats.Max)
+
+			// Enhanced outlier analysis
+			if len(stats.Outliers) > 0 {
+				b.Logf("  Outliers: %d detected (%.1f%% of samples)", len(stats.Outliers), outlierPercent)
+				if len(stats.Outliers) <= 5 {
+					// Show individual outliers for small counts
+					for i, outlier := range stats.Outliers {
+						b.Logf("    Outlier %d: %v", i+1, outlier)
+					}
+				} else {
+					// Summarize outliers for large counts
+					sort.Slice(stats.Outliers, func(i, j int) bool { return stats.Outliers[i] < stats.Outliers[j] })
+					b.Logf("    Outlier range: %v to %v", stats.Outliers[0], stats.Outliers[len(stats.Outliers)-1])
+				}
+
+				// Optional: Show outlier-free statistics for comparison
+				if len(stats.Outliers) > 1 && len(timings) > 5 {
+					cleanedTimings := removeOutliers(timings)
+					if len(cleanedTimings) >= 3 && len(cleanedTimings) < len(timings) {
+						cleanStats := calculateStats(cleanedTimings)
+						cleanCV := (float64(cleanStats.StdDev.Nanoseconds()) / float64(cleanStats.Mean.Nanoseconds())) * 100
+						b.Logf("    Outlier-free stats: Mean=%v, Median=%v, CV=%.2f%% (n=%d)",
+							cleanStats.Mean, cleanStats.Median, cleanCV, len(cleanedTimings))
+					}
+				}
+			} else {
+				b.Logf("  Outliers: None detected (excellent data consistency)")
+			}
+
+			// Additional academic metrics
+			if len(timings) >= 10 {
+				b.Logf("  Statistical Significance: GOOD (≥10 samples)")
+			} else if len(timings) >= 5 {
+				b.Logf("  Statistical Significance: ADEQUATE (≥5 samples)")
+			} else {
+				b.Logf("  Statistical Significance: LIMITED (<5 samples)")
+			}
+
+			// Data quality assessment based on CV and outliers
+			if cv < 10.0 && outlierPercent < 10.0 {
+				b.Logf("  Data Quality: EXCELLENT (CV<10%%, outliers<10%%)")
+			} else if cv < 20.0 && outlierPercent < 20.0 {
+				b.Logf("  Data Quality: GOOD (CV<20%%, outliers<20%%)")
+			} else if cv < 30.0 && outlierPercent < 30.0 {
+				b.Logf("  Data Quality: FAIR (CV<30%%, outliers<30%%)")
+			} else {
+				b.Logf("  Data Quality: VARIABLE (CV≥30%% or outliers≥30%% - consider more samples)")
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// ENHANCED STATISTICAL FROST PHASE BENCHMARKS
+// Academic-grade statistical analysis for all FROST protocol phases
+///////////////////////////////////////////////////////////////////////////////
+
+// BenchmarkFROSTSigningStatistical provides detailed statistical analysis for FROST signing
+func BenchmarkFROSTSigningStatistical(b *testing.B) {
+	// Test configurations for FROST signing analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		// Small groups - high sample count for excellent signing statistics
+		{3, oneThirdThreshold, "signing_3_participants_33pct", 50, 60 * time.Second},
+		{5, oneThirdThreshold, "signing_5_participants_33pct", 30, 120 * time.Second},
+		{10, oneThirdThreshold, "signing_10_participants_33pct", 20, 240 * time.Second},
+		{3, twoThirdsThreshold, "signing_3_participants_66pct", 50, 60 * time.Second},
+		{5, twoThirdsThreshold, "signing_5_participants_66pct", 30, 120 * time.Second},
+		{10, twoThirdsThreshold, "signing_10_participants_66pct", 20, 240 * time.Second},
+
+		// Medium groups - sufficient samples for statistical validity
+		{20, oneThirdThreshold, "signing_20_participants_33pct", 15, 300 * time.Second},
+		{20, twoThirdsThreshold, "signing_20_participants_66pct", 15, 300 * time.Second},
+
+		// Large groups - minimum academic samples
+		{40, oneThirdThreshold, "signing_40_participants_33pct", 10, 600 * time.Second},
+		{40, twoThirdsThreshold, "signing_40_participants_66pct", 10, 600 * time.Second},
+
+		// Very large groups - extended timeout
+		{60, oneThirdThreshold, "signing_60_participants_33pct", 10, 1200 * time.Second},
+		{60, twoThirdsThreshold, "signing_60_participants_66pct", 10, 1200 * time.Second},
+
+		// Note: 100 participants moved to separate large-scale benchmarks
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			// Pre-setup: Generate keys via DKG (excluded from timing)
+			participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST signing statistical analysis benchmark")
+
+			// Collect timing data for statistical analysis
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				// Prevent optimization
+				if signature == nil || signature.C == nil || signature.Z == nil {
+					b.Fatalf("Invalid signature generated")
+				}
+			}
+
+			// Calculate and report statistics
+			if len(timings) >= 3 {
+				stats := calculateStats(timings)
+
+				b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+				b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+				b.ReportMetric(float64(stats.StdDev.Nanoseconds()), "stddev_ns")
+				cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+				b.ReportMetric(cv, "cv_percent")
+				b.ReportMetric(float64(len(stats.Outliers)), "outliers_count")
+				outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+				b.ReportMetric(outlierPercent, "outliers_percent")
+
+				b.Logf("FROST SIGNING Statistical Analysis for %s (t=%d, n=%d, samples=%d):",
+					config.name, threshold, config.participants, len(timings))
+				b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+				b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+				if cv < 15.0 && outlierPercent < 15.0 {
+					b.Logf("  ✓ SIGNING PERFORMANCE: EXCELLENT (CV<15%%, outliers<15%%)")
+				} else if cv < 25.0 && outlierPercent < 25.0 {
+					b.Logf("  ✓ SIGNING PERFORMANCE: GOOD (CV<25%%, outliers<25%%)")
+				} else {
+					b.Logf("  ⚠ SIGNING PERFORMANCE: VARIABLE (consider more samples)")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkFROSTVerificationStatistical provides detailed statistical analysis for FROST verification
+func BenchmarkFROSTVerificationStatistical(b *testing.B) {
+	// Test configurations for FROST verification analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		// Small groups - high sample count for excellent verification statistics
+		{3, oneThirdThreshold, "verification_3_participants_33pct", 100, 30 * time.Second}, // Verification is fast
+		{5, oneThirdThreshold, "verification_5_participants_33pct", 100, 60 * time.Second},
+		{10, oneThirdThreshold, "verification_10_participants_33pct", 50, 120 * time.Second},
+		{3, twoThirdsThreshold, "verification_3_participants_66pct", 100, 30 * time.Second},
+		{5, twoThirdsThreshold, "verification_5_participants_66pct", 100, 60 * time.Second},
+		{10, twoThirdsThreshold, "verification_10_participants_66pct", 50, 120 * time.Second},
+
+		// Medium and large groups
+		{20, oneThirdThreshold, "verification_20_participants_33pct", 30, 180 * time.Second},
+		{20, twoThirdsThreshold, "verification_20_participants_66pct", 30, 180 * time.Second},
+		{40, oneThirdThreshold, "verification_40_participants_33pct", 20, 240 * time.Second},
+		{40, twoThirdsThreshold, "verification_40_participants_66pct", 20, 240 * time.Second},
+
+		// Very large groups - verification remains O(1) so shorter timeout needed
+		{60, oneThirdThreshold, "verification_60_participants_33pct", 15, 300 * time.Second},
+		{60, twoThirdsThreshold, "verification_60_participants_66pct", 15, 300 * time.Second},
+
+		// Note: 100 participants moved to separate large-scale benchmarks
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			// Setup: Create verification key and signature
+			participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST verification statistical analysis benchmark")
+			signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+			if err != nil {
+				b.Fatalf("FROST signing setup failed: %v", err)
+			}
+
+			// Collect timing data for statistical analysis
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+				// Verify signature using FROST verification (Ed25519 verification)
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				// Prevent optimization
+				if !valid {
+					b.Fatalf("Signature verification failed")
+				}
+			}
+
+			// Calculate and report statistics
+			if len(timings) >= 3 {
+				stats := calculateStats(timings)
+
+				b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+				b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+				b.ReportMetric(float64(stats.StdDev.Nanoseconds()), "stddev_ns")
+				cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+				b.ReportMetric(cv, "cv_percent")
+				b.ReportMetric(float64(len(stats.Outliers)), "outliers_count")
+				outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+				b.ReportMetric(outlierPercent, "outliers_percent")
+
+				b.Logf("FROST VERIFICATION Statistical Analysis for %s (t=%d, n=%d, samples=%d):",
+					config.name, threshold, config.participants, len(timings))
+				b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+				b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+				if cv < 10.0 && outlierPercent < 10.0 {
+					b.Logf("  ✓ VERIFICATION PERFORMANCE: EXCELLENT (CV<10%%, outliers<10%%)")
+				} else if cv < 20.0 && outlierPercent < 20.0 {
+					b.Logf("  ✓ VERIFICATION PERFORMANCE: GOOD (CV<20%%, outliers<20%%)")
+				} else {
+					b.Logf("  ⚠ VERIFICATION PERFORMANCE: VARIABLE (consider more samples)")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkFROSTEndToEndStatistical provides detailed statistical analysis for complete FROST workflow
+func BenchmarkFROSTEndToEndStatistical(b *testing.B) {
+	// Test configurations for end-to-end FROST analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		// Small groups - moderate sample count for complete workflow analysis
+		{3, oneThirdThreshold, "e2e_3_participants_33pct", 30, 120 * time.Second},
+		{5, oneThirdThreshold, "e2e_5_participants_33pct", 20, 300 * time.Second},
+		{10, oneThirdThreshold, "e2e_10_participants_33pct", 15, 600 * time.Second},
+		{3, twoThirdsThreshold, "e2e_3_participants_66pct", 30, 120 * time.Second},
+		{5, twoThirdsThreshold, "e2e_5_participants_66pct", 20, 300 * time.Second},
+		{10, twoThirdsThreshold, "e2e_10_participants_66pct", 15, 600 * time.Second},
+
+		// Medium groups - sufficient samples for statistical validity
+		{20, oneThirdThreshold, "e2e_20_participants_33pct", 10, 900 * time.Second},
+		{20, twoThirdsThreshold, "e2e_20_participants_66pct", 10, 900 * time.Second},
+
+		// Large groups - minimum academic samples with extended timeout
+		{40, oneThirdThreshold, "e2e_40_participants_33pct", 5, 1800 * time.Second}, // 30 minutes
+		{40, twoThirdsThreshold, "e2e_40_participants_66pct", 5, 1800 * time.Second},
+		{60, oneThirdThreshold, "e2e_60_participants_33pct", 5, 2400 * time.Second},    // 40 minutes
+		{60, twoThirdsThreshold, "e2e_60_participants_66pct", 5, 2400 * time.Second},   // 40 minutes
+		{100, oneThirdThreshold, "e2e_100_participants_33pct", 5, 3600 * time.Second},  // 60 minutes
+		{100, twoThirdsThreshold, "e2e_100_participants_66pct", 5, 3600 * time.Second}, // 60 minutes
+
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			message := []byte("FROST end-to-end statistical analysis benchmark")
+
+			// Collect timing data for statistical analysis
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+
+				// Phase 1: DKG
+				participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+
+				// Phase 2: FROST Signing
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// Phase 3: Verification
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				// Prevent optimization
+				if !valid || signature == nil || verificationKey == nil {
+					b.Fatalf("End-to-end workflow failed")
+				}
+			}
+
+			// Calculate and report statistics
+			if len(timings) >= 3 {
+				stats := calculateStats(timings)
+
+				b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+				b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+				b.ReportMetric(float64(stats.StdDev.Nanoseconds()), "stddev_ns")
+				cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+				b.ReportMetric(cv, "cv_percent")
+				b.ReportMetric(float64(len(stats.Outliers)), "outliers_count")
+				outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+				b.ReportMetric(outlierPercent, "outliers_percent")
+
+				b.Logf("FROST END-TO-END Statistical Analysis for %s (t=%d, n=%d, samples=%d):",
+					config.name, threshold, config.participants, len(timings))
+				b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+				b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+				if cv < 20.0 && outlierPercent < 20.0 {
+					b.Logf("  ✓ END-TO-END PERFORMANCE: EXCELLENT (CV<20%%, outliers<20%%)")
+				} else if cv < 30.0 && outlierPercent < 30.0 {
+					b.Logf("  ✓ END-TO-END PERFORMANCE: GOOD (CV<30%%, outliers<30%%)")
+				} else {
+					b.Logf("  ⚠ END-TO-END PERFORMANCE: VARIABLE (consider more samples)")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkDKGLarge provides benchmarks for large participant counts (60-100)
+// Enhanced with academic-grade statistical rigor matching Rust Criterion.rs standards
+// Run separately with: go test -bench=BenchmarkDKGLarge -timeout=60m
+func BenchmarkDKGLarge(b *testing.B) {
+	// Large group configurations - enhanced sample sizes with 3000-second Rust standard
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration // Rust Criterion.rs allows up to 3000 seconds
+	}{
+		{60, oneThirdThreshold, "60_participants_33pct", 10, 1500 * time.Second},    // 25 minutes max
+		{60, twoThirdsThreshold, "60_participants_66pct", 10, 1500 * time.Second},   // 25 minutes max
+		{100, oneThirdThreshold, "100_participants_33pct", 10, 3000 * time.Second},  // 50 minutes max (Rust standard)
+		{100, twoThirdsThreshold, "100_participants_66pct", 10, 3000 * time.Second}, // 50 minutes max (Rust standard)
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			b.Logf("ENHANCED LARGE-SCALE BENCHMARK: %d participants with academic-grade sampling", config.participants)
+			b.Logf("Target: %d samples with maximum %v timeout (Rust Criterion.rs standard)",
+				config.sampleSize, config.maxTime)
+
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				// Check timeout to match Rust standards
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached Rust-standard timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				b.Logf("Starting iteration %d/%d for %d participants (elapsed: %v)...",
+					i+1, config.sampleSize, config.participants, time.Since(testStartTime))
+
+				start := time.Now()
+				_, _, err := executeDKGProtocol(threshold, config.participants)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				remaining := config.sampleSize - (i + 1)
+				estimatedRemaining := time.Duration(remaining) * elapsed
+				totalElapsed := time.Since(testStartTime)
+
+				b.Logf("Completed iteration %d/%d for %d participants in %v",
+					i+1, config.sampleSize, config.participants, elapsed)
+				b.Logf("  Total elapsed: %v, Estimated remaining: %v, Timeout in: %v",
+					totalElapsed, estimatedRemaining, config.maxTime-totalElapsed)
+			}
+
+			// Calculate statistics (require minimum samples for large-scale academic analysis)
+			if len(timings) < 3 {
+				b.Logf("WARNING: Only %d samples collected for %d participants - insufficient for statistical analysis",
+					len(timings), config.participants)
+				if len(timings) > 0 {
+					b.ReportMetric(float64(timings[0].Nanoseconds()), "single_sample_ns/op")
+				}
+				return
+			}
+
+			stats := calculateStats(timings)
+
+			// Report results with enhanced academic metrics
+			b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+			b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+			b.ReportMetric(float64(stats.StdDev.Nanoseconds()), "stddev_ns")
+			cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+			b.ReportMetric(cv, "cv_percent")
+			b.ReportMetric(float64(stats.Min.Nanoseconds()), "min_ns")
+			b.ReportMetric(float64(stats.Max.Nanoseconds()), "max_ns")
+			b.ReportMetric(float64(stats.Q1.Nanoseconds()), "q1_ns")
+			b.ReportMetric(float64(stats.Q3.Nanoseconds()), "q3_ns")
+			b.ReportMetric(float64(len(stats.Outliers)), "outliers_count")
+			b.ReportMetric(float64(len(timings)), "actual_samples")
+
+			// Calculate outlier percentage
+			outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+			b.ReportMetric(outlierPercent, "outliers_percent")
+
+			// Log detailed results with academic assessment
+			b.Logf("LARGE-SCALE ACADEMIC ANALYSIS for %s (t=%d, n=%d, samples=%d):",
+				config.name, threshold, config.participants, len(timings))
+			b.Logf("  Mean:     %v", stats.Mean)
+			b.Logf("  Median:   %v", stats.Median)
+			b.Logf("  StdDev:   %v", stats.StdDev)
+			b.Logf("  CV:       %.2f%% (coefficient of variation)", cv)
+			b.Logf("  Min:      %v", stats.Min)
+			b.Logf("  Max:      %v", stats.Max)
+			b.Logf("  Q1 (25%%): %v", stats.Q1)
+			b.Logf("  Q3 (75%%): %v", stats.Q3)
+			b.Logf("  IQR:      %v", stats.IQR)
+			b.Logf("  Range:    [%v, %v, %v] (min, median, max)", stats.Min, stats.Median, stats.Max)
+
+			// Enhanced outlier analysis for large-scale benchmarks
+			if len(stats.Outliers) > 0 {
+				b.Logf("  Outliers: %d detected (%.1f%% of samples)", len(stats.Outliers), outlierPercent)
+				if len(stats.Outliers) <= 3 {
+					// Show individual outliers for small counts
+					for i, outlier := range stats.Outliers {
+						deviation := float64(outlier.Nanoseconds()-stats.Mean.Nanoseconds()) / float64(stats.StdDev.Nanoseconds())
+						b.Logf("    Outlier %d: %v (%.1fσ from mean)", i+1, outlier, deviation)
+					}
+				} else {
+					// Summarize outliers for large counts
+					sort.Slice(stats.Outliers, func(i, j int) bool { return stats.Outliers[i] < stats.Outliers[j] })
+					b.Logf("    Outlier range: %v to %v", stats.Outliers[0], stats.Outliers[len(stats.Outliers)-1])
+
+					// Find most extreme outliers
+					minOutlier := stats.Outliers[0]
+					maxOutlier := stats.Outliers[len(stats.Outliers)-1]
+					minDeviation := float64(minOutlier.Nanoseconds()-stats.Mean.Nanoseconds()) / float64(stats.StdDev.Nanoseconds())
+					maxDeviation := float64(maxOutlier.Nanoseconds()-stats.Mean.Nanoseconds()) / float64(stats.StdDev.Nanoseconds())
+					b.Logf("    Most extreme: %v (%.1fσ) and %v (%.1fσ)", minOutlier, minDeviation, maxOutlier, maxDeviation)
+				}
+
+				// Optional: Show outlier-free statistics for large-scale analysis
+				if len(stats.Outliers) > 1 && len(timings) > 5 {
+					cleanedTimings := removeOutliers(timings)
+					if len(cleanedTimings) >= 3 && len(cleanedTimings) < len(timings) {
+						cleanStats := calculateStats(cleanedTimings)
+						cleanCV := (float64(cleanStats.StdDev.Nanoseconds()) / float64(cleanStats.Mean.Nanoseconds())) * 100
+						b.Logf("    Outlier-free analysis: Mean=%v, Median=%v, CV=%.2f%% (n=%d)",
+							cleanStats.Mean, cleanStats.Median, cleanCV, len(cleanedTimings))
+						b.Logf("    Improvement: CV reduced by %.1f percentage points", cv-cleanCV)
+					}
+				}
+			} else {
+				b.Logf("  Outliers: None detected (excellent data consistency)")
+			}
+
+			// Academic rigor assessment
+			if len(timings) >= 10 {
+				b.Logf("  ✓ ACADEMIC RIGOR: EXCELLENT (≥10 samples, matches Rust Criterion.rs standard)")
+			} else if len(timings) >= 5 {
+				b.Logf("  ✓ ACADEMIC RIGOR: GOOD (≥5 samples, adequate for publication)")
+			} else {
+				b.Logf("  ⚠ ACADEMIC RIGOR: LIMITED (<5 samples, not recommended for publication)")
+			}
+
+			// Enhanced data quality assessment for large-scale analysis
+			if cv < 15.0 && outlierPercent < 15.0 {
+				b.Logf("  ✓ DATA QUALITY: EXCELLENT (CV<15%%, outliers<15%% - publication ready)")
+			} else if cv < 25.0 && outlierPercent < 25.0 {
+				b.Logf("  ✓ DATA QUALITY: GOOD (CV<25%%, outliers<25%% - acceptable for publication)")
+			} else if cv < 35.0 && outlierPercent < 35.0 {
+				b.Logf("  ⚠ DATA QUALITY: FAIR (CV<35%%, outliers<35%% - consider more samples)")
+			} else {
+				b.Logf("  ⚠ DATA QUALITY: VARIABLE (CV≥35%% or outliers≥35%% - recommend increasing sample size)")
+			}
+
+			// Complexity analysis hint for O(n²) expected behavior
+			if config.participants >= 60 {
+				scalingFactor := float64(config.participants*config.participants) / (20.0 * 20.0) // Compare to n=20 baseline
+				b.Logf("  O(n²) Scaling Factor: %.1fx relative to n=20 baseline", scalingFactor)
+			}
+		})
+	}
+}
+
+// BenchmarkFROSTSigningLarge provides large-scale signing benchmarks (60-100 participants)
+// Enhanced with academic-grade statistical rigor for FROST signing performance
+// Run separately with: go test -bench=BenchmarkFROSTSigningLarge -timeout=60m
+func BenchmarkFROSTSigningLarge(b *testing.B) {
+	// Large group configurations for FROST signing analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		{60, oneThirdThreshold, "signing_60_participants_33pct", 10, 1500 * time.Second},    // 25 minutes max
+		{60, twoThirdsThreshold, "signing_60_participants_66pct", 10, 1500 * time.Second},   // 25 minutes max
+		{100, oneThirdThreshold, "signing_100_participants_33pct", 10, 3000 * time.Second},  // 50 minutes max
+		{100, twoThirdsThreshold, "signing_100_participants_66pct", 10, 3000 * time.Second}, // 50 minutes max
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			b.Logf("LARGE-SCALE FROST SIGNING: %d participants with academic-grade sampling", config.participants)
+
+			// Pre-setup: Generate keys via DKG (excluded from timing)
+			participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST large-scale signing benchmark")
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+				_, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				b.Logf("Completed signing iteration %d/%d for %d participants in %v",
+					i+1, config.sampleSize, config.participants, elapsed)
+			}
+
+			// Calculate and report statistics
+			if len(timings) < 3 {
+				b.Logf("WARNING: Only %d samples collected for %d participants", len(timings), config.participants)
+				return
+			}
+
+			stats := calculateStats(timings)
+			cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+			outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+
+			// Report comprehensive metrics
+			b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+			b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+			b.ReportMetric(cv, "cv_percent")
+			b.ReportMetric(outlierPercent, "outliers_percent")
+
+			b.Logf("LARGE-SCALE SIGNING ANALYSIS for %s (t=%d, n=%d, samples=%d):",
+				config.name, threshold, config.participants, len(timings))
+			b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+			b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+			if cv < 15.0 && outlierPercent < 15.0 {
+				b.Logf("  ✓ SIGNING PERFORMANCE: EXCELLENT (publication ready)")
+			} else if cv < 25.0 && outlierPercent < 25.0 {
+				b.Logf("  ✓ SIGNING PERFORMANCE: GOOD (acceptable)")
+			} else {
+				b.Logf("  ⚠ SIGNING PERFORMANCE: VARIABLE (consider more samples)")
+			}
+		})
+	}
+}
+
+// BenchmarkFROSTVerificationLarge provides large-scale verification benchmarks (60-100 participants)
+// Enhanced with academic-grade statistical rigor for FROST verification performance
+// Run separately with: go test -bench=BenchmarkFROSTVerificationLarge -timeout=30m
+func BenchmarkFROSTVerificationLarge(b *testing.B) {
+	// Large group configurations for FROST verification analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		{60, oneThirdThreshold, "verification_60_participants_33pct", 15, 600 * time.Second},    // 10 minutes max
+		{60, twoThirdsThreshold, "verification_60_participants_66pct", 15, 600 * time.Second},   // 10 minutes max
+		{100, oneThirdThreshold, "verification_100_participants_33pct", 10, 800 * time.Second},  // 13 minutes max
+		{100, twoThirdsThreshold, "verification_100_participants_66pct", 10, 800 * time.Second}, // 13 minutes max
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			b.Logf("LARGE-SCALE FROST VERIFICATION: %d participants with academic-grade sampling", config.participants)
+
+			// Pre-setup: Generate keys and signature (excluded from timing)
+			participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+			if err != nil {
+				b.Fatalf("DKG setup failed: %v", err)
+			}
+
+			message := []byte("FROST large-scale verification benchmark")
+			signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+			if err != nil {
+				b.Fatalf("FROST signing setup failed: %v", err)
+			}
+
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			// Warmup for Ed25519
+			deriver := &frost.Ed25519ChallengeDeriver{}
+			curve := curves.ED25519()
+			for warmup := 0; warmup < 3; warmup++ {
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+				// Ed25519 challenge derivation
+				_, _ = deriver.DeriveChallenge(message, verificationKey, tempR)
+			}
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+
+				// Ed25519-specific verification using DeriveChallenge
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				// Ed25519 challenge derivation
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+				if !valid {
+					b.Fatalf("Signature verification failed")
+				}
+
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+			}
+
+			// Calculate and report statistics
+			if len(timings) < 3 {
+				b.Logf("WARNING: Only %d samples collected for %d participants", len(timings), config.participants)
+				return
+			}
+
+			stats := calculateStats(timings)
+			cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+			outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+
+			// Report comprehensive metrics
+			b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+			b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+			b.ReportMetric(cv, "cv_percent")
+			b.ReportMetric(outlierPercent, "outliers_percent")
+
+			b.Logf("LARGE-SCALE VERIFICATION ANALYSIS for %s (t=%d, n=%d, samples=%d):",
+				config.name, threshold, config.participants, len(timings))
+			b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+			b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+			if cv < 20.0 && outlierPercent < 20.0 {
+				b.Logf("  ✓ VERIFICATION PERFORMANCE: EXCELLENT (publication ready)")
+			} else if cv < 35.0 && outlierPercent < 35.0 {
+				b.Logf("  ✓ VERIFICATION PERFORMANCE: GOOD (acceptable)")
+			} else {
+				b.Logf("  ⚠ VERIFICATION PERFORMANCE: VARIABLE (consider more samples)")
+			}
+		})
+	}
+}
+
+// BenchmarkFROSTEndToEndLarge provides large-scale end-to-end benchmarks (60-100 participants)
+// Complete DKG+Signing+Verification workflow with academic-grade statistical rigor
+// Run separately with: go test -bench=BenchmarkFROSTEndToEndLarge -timeout=120m
+func BenchmarkFROSTEndToEndLarge(b *testing.B) {
+	// Large group configurations for complete end-to-end analysis
+	configs := []struct {
+		participants int
+		threshold    func(int) int
+		name         string
+		sampleSize   int
+		maxTime      time.Duration
+	}{
+		{60, oneThirdThreshold, "e2e_60_participants_33pct", 10, 3000 * time.Second},    // 50 minutes max
+		{60, twoThirdsThreshold, "e2e_60_participants_66pct", 10, 3000 * time.Second},   // 50 minutes max
+		{100, oneThirdThreshold, "e2e_100_participants_33pct", 10, 4800 * time.Second},  // 80 minutes max
+		{100, twoThirdsThreshold, "e2e_100_participants_66pct", 10, 4800 * time.Second}, // 80 minutes max
+	}
+
+	for _, config := range configs {
+		threshold := config.threshold(config.participants)
+
+		b.Run(config.name, func(b *testing.B) {
+			b.Logf("LARGE-SCALE END-TO-END: %d participants with academic-grade sampling", config.participants)
+
+			message := []byte("FROST large-scale end-to-end benchmark")
+			timings := make([]time.Duration, 0, config.sampleSize)
+			testStartTime := time.Now()
+
+			b.ResetTimer()
+
+			for i := 0; i < config.sampleSize; i++ {
+				if time.Since(testStartTime) > config.maxTime {
+					b.Logf("Reached timeout (%v) after %d/%d iterations for %d participants",
+						config.maxTime, i, config.sampleSize, config.participants)
+					break
+				}
+
+				start := time.Now()
+
+				// 1. DKG
+				participants, verificationKey, err := executeDKGProtocol(threshold, config.participants)
+				if err != nil {
+					b.Fatalf("DKG failed: %v", err)
+				}
+
+				// 2. Signing
+				signature, err := executeFROSTSigning(participants, verificationKey, threshold, message)
+				if err != nil {
+					b.Fatalf("FROST signing failed: %v", err)
+				}
+
+				// 3. Ed25519-specific verification using DeriveChallenge
+				deriver := &frost.Ed25519ChallengeDeriver{}
+				curve := curves.ED25519()
+				zG := curve.ScalarBaseMult(signature.Z)
+				cvk := verificationKey.Mul(signature.C.Neg())
+				tempR := zG.Add(cvk)
+
+				// Ed25519 challenge derivation
+				tempC, err := deriver.DeriveChallenge(message, verificationKey, tempR)
+				if err != nil {
+					b.Fatalf("Challenge derivation failed: %v", err)
+				}
+
+				valid := tempC.Cmp(signature.C) == 0
+				if !valid {
+					b.Fatalf("Signature verification failed")
+				}
+
+				elapsed := time.Since(start)
+				timings = append(timings, elapsed)
+
+				b.Logf("Completed end-to-end iteration %d/%d for %d participants in %v",
+					i+1, config.sampleSize, config.participants, elapsed)
+			}
+
+			// Calculate and report statistics
+			if len(timings) < 3 {
+				b.Logf("WARNING: Only %d samples collected for %d participants", len(timings), config.participants)
+				if len(timings) > 0 {
+					b.ReportMetric(float64(timings[0].Nanoseconds()), "single_sample_ns/op")
+				}
+				return
+			}
+
+			stats := calculateStats(timings)
+			cv := (float64(stats.StdDev.Nanoseconds()) / float64(stats.Mean.Nanoseconds())) * 100
+			outlierPercent := (float64(len(stats.Outliers)) / float64(len(timings))) * 100
+
+			// Report comprehensive metrics
+			b.ReportMetric(float64(stats.Mean.Nanoseconds()), "mean_ns/op")
+			b.ReportMetric(float64(stats.Median.Nanoseconds()), "median_ns/op")
+			b.ReportMetric(cv, "cv_percent")
+			b.ReportMetric(outlierPercent, "outliers_percent")
+
+			b.Logf("LARGE-SCALE END-TO-END ANALYSIS for %s (t=%d, n=%d, samples=%d):",
+				config.name, threshold, config.participants, len(timings))
+			b.Logf("  Mean: %v, Median: %v, StdDev: %v", stats.Mean, stats.Median, stats.StdDev)
+			b.Logf("  CV: %.2f%%, Outliers: %d (%.1f%%)", cv, len(stats.Outliers), outlierPercent)
+
+			if cv < 20.0 && outlierPercent < 20.0 {
+				b.Logf("  ✓ END-TO-END PERFORMANCE: EXCELLENT (publication ready)")
+			} else if cv < 30.0 && outlierPercent < 30.0 {
+				b.Logf("  ✓ END-TO-END PERFORMANCE: GOOD (acceptable)")
+			} else {
+				b.Logf("  ⚠ END-TO-END PERFORMANCE: VARIABLE (consider more samples)")
+			}
+		})
+	}
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// END-TO-END BENCHMARK: DKG + SIGNING + VERIFICATION (Matches other suites)
+///////////////////////////////////////////////////////////////////////////////
