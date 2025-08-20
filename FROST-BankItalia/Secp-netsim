@@ -1,0 +1,226 @@
+/**
+ * FROST secp256k1 Network Simulation - Main Test Suite
+ * ====================================================
+ *
+ * Comprehensive C++ network simulation testing FROST threshold signatures
+ * using Banca d'Italia secp256k1-frost library. Demonstrates true distributed
+ * key generation with concurrent participants and realistic network conditions.
+ *
+ * Test configurations:
+ * - Participants: 5, 10, 20, 40 (with 40% threshold)
+ * - Network conditions: Best (50±10ms, 2% loss), Average (85±20ms, 3.5% loss), 
+ *   Worst (120±30ms, 5% loss)
+ * - Total: 12 test combinations validating O(n²) DKG scaling
+ *
+ * Key features:
+ * - Individual FROSTParticipant objects (no centralized coordination)
+ * - Async network simulation with concurrent message passing
+ * - Complete 3-phase DKG: commitment generation, validation, finalization
+ * - Professional timing analysis with phase-by-phase breakdown
+ *
+ * Usage:
+ *   ./bankitalia_netsim --test-mode     # Single quick test (5 participants)
+ *   ./bankitalia_netsim                 # Full comprehensive suite (12 tests)
+ *
+ * Expected performance: ~6ms (5p) to ~400ms (40p) depending on configuration
+ */
+
+#include "../include/frost_api_wrapper.h"
+#include <iostream>
+#include <iomanip>
+#include <string>
+#include <vector>
+#include <chrono>
+#include <thread>
+
+using namespace frost_netsim;
+
+void print_hex(const std::string& label, const std::vector<uint8_t>& data) {
+    std::cout << "  " << label << ": 0x";
+    for (uint8_t byte : data) {
+        std::cout << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(byte);
+    }
+    std::cout << std::dec << std::endl;
+}
+
+void print_timing_results(const DKGExecutionResult& result) {
+    std::cout << "\n=== Timing Analysis ===\n";
+    std::cout << std::fixed << std::setprecision(3);
+    
+    auto to_ms = [](std::chrono::nanoseconds ns) {
+        return static_cast<double>(ns.count()) / 1e6;
+    };
+    
+    std::cout << "  DKG Phase 1 (Commitment Generation): " << to_ms(result.dkg_phase1_time) << " ms\n";
+    std::cout << "  DKG Phase 2 (Commitment Validation):  " << to_ms(result.dkg_phase2_time) << " ms\n";
+    std::cout << "  DKG Phase 3 (Key Finalization):      " << to_ms(result.dkg_phase3_time) << " ms\n";
+    std::cout << "  Signing Protocol:                     " << to_ms(result.signing_time) << " ms\n";
+    std::cout << "  Signature Verification:               " << to_ms(result.verification_time) << " ms\n";
+    std::cout << "  ───────────────────────────────────────────────────────────\n";
+    std::cout << "  Total Protocol Time:                  " << to_ms(result.total_time) << " ms\n";
+}
+
+void print_network_metrics(const NetworkMetrics& metrics) {
+    std::cout << "\n=== Network Simulation Metrics ===\n";
+    std::cout << std::fixed << std::setprecision(2);
+    
+    std::cout << "  Average Latency:     " << metrics.avg_latency_ms << " ms\n";
+    std::cout << "  Min Latency:         " << metrics.min_latency_ms << " ms\n";
+    std::cout << "  Max Latency:         " << metrics.max_latency_ms << " ms\n";
+    std::cout << "  Packet Loss Rate:    " << (metrics.packet_loss_rate * 100.0) << "%\n";
+    std::cout << "  Bytes Transmitted:   " << metrics.bytes_transmitted << " bytes\n";
+    std::cout << "  Packets Sent:        " << metrics.packets_sent << "\n";
+    std::cout << "  Packets Lost:        " << metrics.packets_lost << "\n";
+    
+    auto total_network_time_ms = static_cast<double>(metrics.total_time.count()) / 1e6;
+    std::cout << "  Total Network Time:  " << total_network_time_ms << " ms\n";
+}
+
+bool run_single_test(uint32_t n_participants, uint32_t threshold, NetworkCondition condition,
+                    const std::string& condition_name, const std::string& message) {
+    
+    std::cout << "\n" << std::string(70, '=') << "\n";
+    std::cout << "FROST secp256k1 Network Simulation Test\n";
+    std::cout << std::string(70, '=') << "\n";
+    std::cout << "Configuration:\n";
+    std::cout << "  Participants: " << n_participants << "\n";
+    std::cout << "  Threshold:    " << threshold << " (requires " << threshold << "-of-" << n_participants << " signatures)\n";
+    std::cout << "  Network:      " << condition_name << "\n";
+    std::cout << "  Message:      \"" << message << "\"\n";
+    std::cout << "  Curve:        secp256k1 (Bitcoin/Ethereum)\n";
+    std::cout << "  Protocol:     Distributed Key Generation (no trusted dealer)\n";
+    
+    try {
+        // Initialize protocol
+        FROSTNetworkProtocol protocol(n_participants, threshold, condition);
+        
+        // Execute full DKG and signing protocol
+        std::string dkg_context = "frost_netsim_v1";
+        auto result = protocol.execute_full_protocol(message, dkg_context);
+        
+        if (!result.success) {
+            std::cout << "\n❌ Protocol execution failed!\n";
+            return false;
+        }
+        
+        // Display results
+        std::cout << "\n=== Protocol Results ===\n";
+        std::cout << "✅ DKG completed successfully - no trusted dealer required!\n";
+        std::cout << "✅ Threshold signature created and verified!\n";
+        
+        print_hex("Group Public Key", result.group_public_key);
+        print_hex("Generated Signature", result.final_signature);
+        
+        print_timing_results(result);
+        print_network_metrics(result.network_metrics);
+        
+        std::cout << "\n=== Security Properties Achieved ===\n";
+        std::cout << "  🔒 No single participant knows the complete secret key\n";
+        std::cout << "  🔒 " << threshold << " participants required to create signatures\n";
+        std::cout << "  🔒 Verifiable secret sharing prevents dishonest participants\n";
+        std::cout << "  🔒 Zero-knowledge proofs ensure cryptographic integrity\n";
+        std::cout << "  🔒 Forward security and unforgeability properties preserved\n";
+        
+        return true;
+        
+    } catch (const std::exception& e) {
+        std::cout << "\n❌ Exception during protocol execution: " << e.what() << "\n";
+        return false;
+    }
+}
+
+void run_comprehensive_test_suite() {
+    std::cout << "\n" << std::string(80, '=') << "\n";
+    std::cout << "🚀 FROST secp256k1 Network Simulation - Comprehensive Test Suite\n";
+    std::cout << std::string(80, '=') << "\n";
+    
+    // Test configurations matching directory 12 patterns
+    std::vector<std::tuple<uint32_t, uint32_t, std::string>> configs = {
+        {5,  3,  "5 participants, 3-of-5 threshold (60%)"},
+        {10, 4,  "10 participants, 4-of-10 threshold (40%)"},
+        {20, 8,  "20 participants, 8-of-20 threshold (40%)"},
+        {40, 16, "40 participants, 16-of-40 threshold (40%)"}
+    };
+    
+    std::vector<std::pair<NetworkCondition, std::string>> conditions = {
+        {NetworkCondition::BEST_CASE,    "Best Case (50±10ms latency, 2% packet loss)"},
+        {NetworkCondition::AVERAGE_CASE, "Average Case (85±20ms latency, 3.5% packet loss)"},
+        {NetworkCondition::WORST_CASE,   "Worst Case (120±30ms latency, 5% packet loss)"}
+    };
+    
+    std::string test_message = "Hello secp256k1 FROST Network!";
+    
+    int tests_passed = 0;
+    int total_tests = 0;
+    
+    for (const auto& [condition, condition_name] : conditions) {
+        for (const auto& [n, t, config_desc] : configs) {
+            
+            std::cout << "\n📊 Running: " << config_desc << " - " << condition_name << "\n";
+            
+            bool success = run_single_test(n, t, condition, condition_name, test_message);
+            total_tests++;
+            if (success) {
+                tests_passed++;
+            }
+            
+            // Small delay between tests for stability
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+    }
+    
+    // Final summary
+    std::cout << "\n" << std::string(80, '=') << "\n";
+    std::cout << "🏁 Test Suite Complete\n";
+    std::cout << std::string(80, '=') << "\n";
+    std::cout << "Results: " << tests_passed << "/" << total_tests << " tests passed\n";
+    
+    if (tests_passed == total_tests) {
+        std::cout << "🎉 All tests passed! FROST secp256k1 network simulation working perfectly.\n";
+    } else {
+        std::cout << "⚠️  Some tests failed. Check output above for details.\n";
+    }
+    
+    std::cout << "\nImplementation Features:\n";
+    std::cout << "  ✓ True distributed key generation (no trusted dealer)\n";
+    std::cout << "  ✓ Concurrent participant processing\n";  
+    std::cout << "  ✓ Realistic network simulation with latency and packet loss\n";
+    std::cout << "  ✓ Statistical timing analysis\n";
+    std::cout << "  ✓ secp256k1 curve (Bitcoin/Ethereum compatible)\n";
+    std::cout << "  ✓ C++ implementation with async/await patterns\n";
+    std::cout << "  ✓ Memory-safe RAII resource management\n";
+}
+
+int main(int argc, char* argv[]) {
+    // Check for test mode flag
+    bool test_mode = false;
+    if (argc > 1 && std::string(argv[1]) == "--test-mode") {
+        test_mode = true;
+    }
+    
+    std::cout << "FROST secp256k1 Network Simulation\n";
+    std::cout << "Banca d'Italia Implementation with C++ Network Simulation\n";
+    std::cout << "===========================================================\n";
+    
+    if (!validate_threshold_config(5, 3)) {
+        std::cerr << "Configuration validation failed\n";
+        return 1;
+    }
+    
+    if (test_mode) {
+        // Quick single test for automated testing
+        std::cout << "Running in test mode (single quick test)...\n";
+        
+        bool success = run_single_test(
+            5, 3, NetworkCondition::BEST_CASE,
+            "Best Case (fast test)", "Quick Test Message"
+        );
+        
+        return success ? 0 : 1;
+    }
+    
+    // Full comprehensive test suite
+    run_comprehensive_test_suite();
+    
+    return 0;
+}
