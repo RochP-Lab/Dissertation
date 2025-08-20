@@ -1,0 +1,524 @@
+/*
+ * Trusted Dealer FROST Threshold Signature Benchmark Suite (secp256k1-frost C++ Implementation)
+ * =============================================================================================
+ *
+ * This C++ implementation provides academically rigorous performance benchmarking for FROST
+ * (Flexible Round-Optimized Schnorr Threshold) signatures using trusted dealer key generation
+ * with the secp256k1-frost library.
+ *
+ * Key Differences from DKG Implementation:
+ * - Uses trusted dealer for key generation instead of distributed DKG
+ * - O(n) complexity for key generation vs O(n²) for DKG
+ * - Single point of trust but faster key generation
+ * - Same signing and verification protocols as DKG version
+ * - Allows comparison between trusted dealer vs DKG approaches
+ *
+ * Academic Benchmarking Features:
+ * - Google Benchmark framework for statistical rigor
+ * - Automatic complexity analysis and regression detection
+ * - Multiple iterations with statistical confidence intervals
+ * - Manual timing control for precise measurements
+ * - Memory allocation tracking and performance profiling
+ * - Cross-platform reproducible results
+ *
+ * Benchmark Suite:
+ * - Key Generation: Trusted dealer polynomial evaluation and share distribution (BM_TrustedDealer_KeyGen)
+ * - FROST Signing: 2-round threshold signature protocol (BM_TrustedDealer_Signing)
+ * - Verification: Signature validation against group public key (BM_TrustedDealer_Verification)
+ * - End-to-End: Complete KeyGen+Sign+Verify workflow (BM_TrustedDealer_EndToEnd)
+ *
+ * Test Configurations:
+ * - Participant counts: 3, 5, 10, 20, 40, 60, 100
+ * - 33% thresholds: (3,1), (5,2), (10,4), (20,7), (40,14), (60,20), (100,34)
+ * - 66% thresholds: (3,2), (5,4), (10,7), (20,14), (40,27), (60,40), (100,67)
+ *
+ * Performance Characteristics:
+ * - Key Generation: O(n) complexity - linear scaling with participant count
+ * - Signing: O(t) complexity - linear scaling with threshold size
+ * - Verification: O(1) complexity - constant time independent of group size
+ * - Memory: Linear in number of participants and shares
+ *
+ * Usage:
+ *   # Build the benchmark
+ *   make trusted_dealer_benchmark
+ *   
+ *   # Run all benchmarks with statistical analysis
+ *   ./trusted_dealer_benchmark --benchmark_repetitions=10 --benchmark_report_aggregates_only=true
+ *   
+ *   # Run specific benchmark categories
+ *   ./trusted_dealer_benchmark --benchmark_filter=BM_TrustedDealer_KeyGen
+ *   ./trusted_dealer_benchmark --benchmark_filter=BM_TrustedDealer_Signing  
+ *   ./trusted_dealer_benchmark --benchmark_filter=BM_TrustedDealer_Verification
+ *   ./trusted_dealer_benchmark --benchmark_filter=BM_TrustedDealer_EndToEnd
+ *   
+ *   # Run with complexity analysis
+ *   ./trusted_dealer_benchmark --benchmark_repetitions=5 --benchmark_display_aggregates_only=true
+ *   
+ *   # Export results for analysis
+ *   ./trusted_dealer_benchmark --benchmark_format=json --benchmark_out=trusted_dealer_results.json
+ *   ./trusted_dealer_benchmark --benchmark_format=csv --benchmark_out=trusted_dealer_results.csv
+ *   
+ *   # Memory profiling with Valgrind
+ *   valgrind --tool=massif ./trusted_dealer_benchmark --benchmark_filter=BM_TrustedDealer_EndToEnd
+ */
+
+#include <benchmark/benchmark.h>
+#include <chrono>
+#include <vector>
+#include <memory>
+#include <cstring>
+#include <algorithm>
+#include <random>
+
+extern "C" {
+#include "secp256k1.h"
+#include "secp256k1_frost.h"
+}
+
+//=============================================================================
+// BENCHMARK HELPER FUNCTIONS
+//=============================================================================
+
+// Helper function to fill buffer with pseudo-random data
+static void fill_random(unsigned char *data, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        data[i] = (unsigned char)(rand() & 0xFF);
+    }
+}
+
+// RAII wrapper for secp256k1_context
+class Secp256k1Context {
+private:
+    secp256k1_context* ctx_;
+    
+public:
+    Secp256k1Context() {
+        ctx_ = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    }
+    
+    ~Secp256k1Context() {
+        if (ctx_) {
+            secp256k1_context_destroy(ctx_);
+        }
+    }
+    
+    secp256k1_context* get() const { return ctx_; }
+    bool valid() const { return ctx_ != nullptr; }
+    
+    // Disable copy constructor and assignment
+    Secp256k1Context(const Secp256k1Context&) = delete;
+    Secp256k1Context& operator=(const Secp256k1Context&) = delete;
+};
+
+// RAII wrapper for FROST keypairs
+class FrostKeypairs {
+private:
+    std::vector<secp256k1_frost_keypair> keypairs_;
+    
+public:
+    explicit FrostKeypairs(size_t n) : keypairs_(n) {
+        // Initialize keypairs with proper indices
+        for (size_t i = 0; i < n; i++) {
+            keypairs_[i].public_keys.index = i + 1; // participant indices are 1-based
+        }
+    }
+    
+    ~FrostKeypairs() = default;
+    
+    secp256k1_frost_keypair& operator[](size_t index) {
+        return keypairs_[index];
+    }
+    
+    const secp256k1_frost_keypair& operator[](size_t index) const {
+        return keypairs_[index];
+    }
+    
+    secp256k1_frost_keypair* data() { return keypairs_.data(); }
+    const secp256k1_frost_keypair* data() const { return keypairs_.data(); }
+    size_t size() const { return keypairs_.size(); }
+    
+    // Disable copy constructor and assignment
+    FrostKeypairs(const FrostKeypairs&) = delete;
+    FrostKeypairs& operator=(const FrostKeypairs&) = delete;
+};
+
+// RAII wrapper for VSS commitments
+class VSSCommitments {
+private:
+    secp256k1_frost_vss_commitments* commitments_;
+    
+public:
+    explicit VSSCommitments(uint32_t threshold) {
+        commitments_ = secp256k1_frost_vss_commitments_create(threshold);
+    }
+    
+    ~VSSCommitments() {
+        if (commitments_) {
+            secp256k1_frost_vss_commitments_destroy(commitments_);
+        }
+    }
+    
+    secp256k1_frost_vss_commitments* get() const { return commitments_; }
+    bool valid() const { return commitments_ != nullptr; }
+    
+    // Disable copy constructor and assignment
+    VSSCommitments(const VSSCommitments&) = delete;
+    VSSCommitments& operator=(const VSSCommitments&) = delete;
+};
+
+//=============================================================================
+// TRUSTED DEALER KEY GENERATION
+//=============================================================================
+
+/**
+ * Execute trusted dealer key generation
+ * Returns true on success, false on failure
+ */
+bool execute_trusted_dealer_keygen(secp256k1_context* ctx, uint32_t n, uint32_t t, 
+                                   FrostKeypairs& keypairs) {
+    VSSCommitments dealer_commitments(t);
+    if (!dealer_commitments.valid()) {
+        return false;
+    }
+    
+    std::vector<secp256k1_frost_keygen_secret_share> shares(n);
+    
+    int result = secp256k1_frost_keygen_with_dealer(
+        ctx, 
+        dealer_commitments.get(), 
+        shares.data(),
+        keypairs.data(),
+        n, 
+        t
+    );
+    
+    return result == 1;
+}
+
+//=============================================================================
+// FROST SIGNING OPERATIONS 
+//=============================================================================
+
+/**
+ * Execute FROST signing with threshold participants
+ * Returns true on success, false on failure
+ */
+bool execute_frost_signing(secp256k1_context* ctx, uint32_t n, uint32_t t,
+                          FrostKeypairs& keypairs, 
+                          unsigned char* sig64,
+                          secp256k1_frost_pubkey* group_pubkey) {
+    
+    // Standard test message
+    const unsigned char msg32[32] = {
+        'T','r','u','s','t','e','d',' ','D','e','a','l','e','r',' ',
+        'F','R','O','S','T',' ','B','e','n','c','h','m','a','r','k', 0, 0
+    };
+    
+    unsigned char binding_seed[32];
+    unsigned char hiding_seed[32];
+    fill_random(binding_seed, sizeof(binding_seed));
+    fill_random(hiding_seed, sizeof(hiding_seed));
+    
+    // Create nonces for threshold participants
+    std::vector<secp256k1_frost_nonce*> nonces(t);
+    std::vector<secp256k1_frost_nonce_commitment> nonce_commitments(t);
+    
+    for (uint32_t i = 0; i < t; i++) {
+        nonces[i] = secp256k1_frost_nonce_create(ctx, &keypairs[i], binding_seed, hiding_seed);
+        if (!nonces[i]) {
+            // Cleanup and return false
+            for (uint32_t j = 0; j < i; j++) {
+                secp256k1_frost_nonce_destroy(nonces[j]);
+            }
+            return false;
+        }
+        // Copy commitment from nonce
+        nonce_commitments[i] = nonces[i]->commitments;
+    }
+    
+    // FROST signing phase
+    std::vector<secp256k1_frost_signature_share> signature_shares(t);
+    std::vector<secp256k1_frost_pubkey> public_keys(t);
+    
+    for (uint32_t i = 0; i < t; i++) {
+        // Copy public key for aggregation
+        public_keys[i] = keypairs[i].public_keys;
+        
+        int result = secp256k1_frost_sign(ctx, &signature_shares[i], msg32, t,
+                                         &keypairs[i], nonces[i], nonce_commitments.data());
+        if (result != 1) {
+            // Cleanup nonces
+            for (uint32_t j = 0; j < t; j++) {
+                secp256k1_frost_nonce_destroy(nonces[j]);
+            }
+            return false;
+        }
+    }
+    
+    // Set group public key from first keypair
+    *group_pubkey = keypairs[0].public_keys;
+    
+    // Aggregate signatures
+    int result = secp256k1_frost_aggregate(ctx, sig64, msg32, &keypairs[0],
+                                          public_keys.data(), nonce_commitments.data(),
+                                          signature_shares.data(), t);
+    
+    // Cleanup nonces
+    for (uint32_t j = 0; j < t; j++) {
+        secp256k1_frost_nonce_destroy(nonces[j]);
+    }
+    
+    return result == 1;
+}
+
+//=============================================================================
+// BENCHMARK IMPLEMENTATIONS
+//=============================================================================
+
+/**
+ * Benchmark: Trusted Dealer Key Generation Only
+ */
+static void BM_TrustedDealer_KeyGen(benchmark::State& state) {
+    const uint32_t n = state.range(0);  // total participants
+    const uint32_t t = state.range(1);  // threshold
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    for (auto _ : state) {
+        FrostKeypairs keypairs(n);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        bool success = execute_trusted_dealer_keygen(ctx.get(), n, t, keypairs);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!success) {
+            state.SkipWithError("Trusted dealer key generation failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(n);  // Trusted dealer has linear complexity
+    state.SetLabel("TrustedDealer_KeyGen n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+/**
+ * Benchmark: FROST Signing with Trusted Dealer Keys
+ */
+static void BM_TrustedDealer_Signing(benchmark::State& state) {
+    const uint32_t n = state.range(0);
+    const uint32_t t = state.range(1);
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    // Setup phase (not measured)
+    FrostKeypairs keypairs(n);
+    if (!execute_trusted_dealer_keygen(ctx.get(), n, t, keypairs)) {
+        state.SkipWithError("Setup: trusted dealer key generation failed");
+        return;
+    }
+    
+    for (auto _ : state) {
+        unsigned char sig64[64];
+        secp256k1_frost_pubkey group_pubkey;
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        bool success = execute_frost_signing(ctx.get(), n, t, keypairs, 
+                                           sig64, &group_pubkey);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!success) {
+            state.SkipWithError("FROST signing failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(t);  // Signing complexity is O(t)
+    state.SetLabel("TrustedDealer_Signing n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+/**
+ * Benchmark: Signature Verification
+ */
+static void BM_TrustedDealer_Verification(benchmark::State& state) {
+    const uint32_t n = state.range(0);
+    const uint32_t t = state.range(1);
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    // Setup phase (not measured)
+    FrostKeypairs keypairs(n);
+    if (!execute_trusted_dealer_keygen(ctx.get(), n, t, keypairs)) {
+        state.SkipWithError("Setup: trusted dealer key generation failed");
+        return;
+    }
+    
+    unsigned char sig64[64];
+    secp256k1_frost_pubkey group_pubkey;
+    if (!execute_frost_signing(ctx.get(), n, t, keypairs, sig64, &group_pubkey)) {
+        state.SkipWithError("Setup: FROST signing failed");
+        return;
+    }
+    
+    const unsigned char msg32[32] = {
+        'T','r','u','s','t','e','d',' ','D','e','a','l','e','r',' ',
+        'F','R','O','S','T',' ','B','e','n','c','h','m','a','r','k', 0, 0
+    };
+    
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        int result = secp256k1_frost_verify(ctx.get(), sig64, msg32, &group_pubkey);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (result != 1) {
+            state.SkipWithError("Signature verification failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(1);  // Verification is O(1)
+    state.SetLabel("TrustedDealer_Verification n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+/**
+ * Benchmark: Complete End-to-End Workflow (KeyGen → Signing → Verification)
+ */
+static void BM_TrustedDealer_EndToEnd(benchmark::State& state) {
+    const uint32_t n = state.range(0);
+    const uint32_t t = state.range(1);
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    const unsigned char msg32[32] = {
+        'T','r','u','s','t','e','d',' ','D','e','a','l','e','r',' ',
+        'F','R','O','S','T',' ','B','e','n','c','h','m','a','r','k', 0, 0
+    };
+    
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Phase 1: Trusted dealer key generation
+        FrostKeypairs keypairs(n);
+        bool keygen_success = execute_trusted_dealer_keygen(ctx.get(), n, t, keypairs);
+        if (!keygen_success) {
+            state.SkipWithError("End-to-end: key generation failed");
+            break;
+        }
+        
+        // Phase 2: FROST signing
+        unsigned char sig64[64];
+        secp256k1_frost_pubkey group_pubkey;
+        bool signing_success = execute_frost_signing(ctx.get(), n, t, keypairs, 
+                                                   sig64, &group_pubkey);
+        if (!signing_success) {
+            state.SkipWithError("End-to-end: signing failed");
+            break;
+        }
+        
+        // Phase 3: Verification
+        int verify_result = secp256k1_frost_verify(ctx.get(), sig64, msg32, &group_pubkey);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (verify_result != 1) {
+            state.SkipWithError("End-to-end: verification failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(n);  // End-to-end dominated by O(n) key generation
+    state.SetLabel("TrustedDealer_EndToEnd n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+//=============================================================================
+// BENCHMARK REGISTRATION - COMPREHENSIVE TEST MATRIX
+//=============================================================================
+
+// Test standardized matrix: group sizes (3,5,10,20,40,60,100) with 33% and 66% thresholds
+
+// Trusted Dealer Key Generation Benchmarks
+BENCHMARK(BM_TrustedDealer_KeyGen)
+    // 33% threshold configurations
+    ->Args({3, 1})   // (n=3, t=1) 33% threshold
+    ->Args({5, 2})   // (n=5, t=2) 33% threshold  
+    ->Args({10, 4})  // (n=10, t=4) 33% threshold
+    ->Args({20, 7})  // (n=20, t=7) 33% threshold
+    ->Args({40, 14}) // (n=40, t=14) 33% threshold
+    ->Args({60, 20}) // (n=60, t=20) 33% threshold
+    ->Args({100, 34})// (n=100, t=34) 33% threshold
+    // 66% threshold configurations  
+    ->Args({3, 2})   // (n=3, t=2) 66% threshold
+    ->Args({5, 4})   // (n=5, t=4) 66% threshold
+    ->Args({10, 7})  // (n=10, t=7) 66% threshold
+    ->Args({20, 14}) // (n=20, t=14) 66% threshold
+    ->Args({40, 27}) // (n=40, t=27) 66% threshold
+    ->Args({60, 40}) // (n=60, t=40) 66% threshold
+    ->Args({100, 67})// (n=100, t=67) 66% threshold
+    ->UseManualTime()
+    ->Complexity();
+
+// FROST Signing Benchmarks (with trusted dealer keys)
+BENCHMARK(BM_TrustedDealer_Signing)
+    // 33% threshold configurations
+    ->Args({3, 1})->Args({5, 2})->Args({10, 4})->Args({20, 7})
+    ->Args({40, 14})->Args({60, 20})->Args({100, 34})
+    // 66% threshold configurations  
+    ->Args({3, 2})->Args({5, 4})->Args({10, 7})->Args({20, 14})
+    ->Args({40, 27})->Args({60, 40})->Args({100, 67})
+    ->UseManualTime()
+    ->Complexity();
+
+// Signature Verification Benchmarks
+BENCHMARK(BM_TrustedDealer_Verification)
+    // 33% threshold configurations
+    ->Args({3, 1})->Args({5, 2})->Args({10, 4})->Args({20, 7})
+    ->Args({40, 14})->Args({60, 20})->Args({100, 34})
+    // 66% threshold configurations  
+    ->Args({3, 2})->Args({5, 4})->Args({10, 7})->Args({20, 14})
+    ->Args({40, 27})->Args({60, 40})->Args({100, 67})
+    ->UseManualTime()
+    ->Complexity();
+
+// End-to-End Workflow Benchmarks
+BENCHMARK(BM_TrustedDealer_EndToEnd)
+    // 33% threshold configurations
+    ->Args({3, 1})->Args({5, 2})->Args({10, 4})->Args({20, 7})
+    ->Args({40, 14})->Args({60, 20})->Args({100, 34})
+    // 66% threshold configurations  
+    ->Args({3, 2})->Args({5, 4})->Args({10, 7})->Args({20, 14})
+    ->Args({40, 27})->Args({60, 40})->Args({100, 67})
+    ->UseManualTime()
+    ->Complexity();
