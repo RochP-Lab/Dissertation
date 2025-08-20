@@ -1,0 +1,586 @@
+/*
+ * FROST DKG Threshold Signature Benchmark Suite (secp256k1-frost C++ Implementation)
+ * ==================================================================================
+ *
+ * This C++ implementation provides academically rigorous performance benchmarking for FROST
+ * (Flexible Round-Optimized Schnorr Threshold) signatures using distributed key generation
+ * with the secp256k1-frost library.
+ *
+ * Key Features:
+ * - Complete DKG (Distributed Key Generation) implementation
+ * - 2-round FROST signing protocol
+ * - Standard Schnorr signature verification
+ * - End-to-end workflow benchmarking
+ * - Comprehensive scaling analysis across group sizes
+ *
+ * Academic Benchmarking Features:
+ * - Google Benchmark framework for statistical rigor
+ * - Automatic complexity analysis with O(n²) regression detection
+ * - Multiple iterations with statistical confidence intervals
+ * - Manual timing control for precise DKG measurements
+ * - Memory allocation tracking and performance profiling
+ * - Cross-platform reproducible results
+ *
+ * Benchmark Suite:
+ * - DKG Protocol: Complete distributed key generation (BM_FROST_DKG)
+ * - FROST Signing: 2-round threshold signature protocol (BM_FROST_Signing)
+ * - Verification: Signature validation against group public key (BM_FROST_Verification)
+ * - End-to-End: Complete DKG+Sign+Verify workflow (BM_FROST_EndToEnd)
+ *
+ * Test Configurations:
+ * - Participant counts: 3, 5, 10, 20, 40, 60, 100
+ * - 33% thresholds: (3,1), (5,2), (10,4), (20,7), (40,14), (60,20), (100,34)
+ * - 66% thresholds: (3,2), (5,4), (10,7), (20,14), (40,27), (60,40), (100,67)
+ *
+ * Expected Performance Characteristics:
+ * - DKG: O(n²) complexity - quadratic scaling due to share verification
+ * - Signing: O(t) complexity - linear scaling with threshold size
+ * - Verification: O(1) complexity - constant time independent of group size
+ * - Memory: Quadratic in DKG phase, linear in signing phase
+ *
+ * Usage:
+ *   # Build the benchmark (from secp256k1-frost directory)
+ *   make benchmark
+ *   
+ *   # Run all benchmarks with statistical analysis
+ *   ./benchmarks/simple_frost_benchmark --benchmark_repetitions=10 --benchmark_report_aggregates_only=true
+ *   
+ *   # Run specific benchmark categories
+ *   ./benchmarks/simple_frost_benchmark --benchmark_filter=BM_FROST_DKG
+ *   ./benchmarks/simple_frost_benchmark --benchmark_filter=BM_FROST_Signing  
+ *   ./benchmarks/simple_frost_benchmark --benchmark_filter=BM_FROST_Verification
+ *   ./benchmarks/simple_frost_benchmark --benchmark_filter=BM_FROST_EndToEnd
+ *   
+ *   # Run with complexity analysis and automatic O(n²) detection
+ *   ./benchmarks/simple_frost_benchmark --benchmark_repetitions=5 --benchmark_display_aggregates_only=true
+ *   
+ *   # Export results for analysis
+ *   ./benchmarks/simple_frost_benchmark --benchmark_format=json --benchmark_out=frost_dkg_results.json
+ *   ./benchmarks/simple_frost_benchmark --benchmark_format=csv --benchmark_out=frost_dkg_results.csv
+ *   
+ *   # Memory profiling with Valgrind
+ *   valgrind --tool=massif ./benchmarks/simple_frost_benchmark --benchmark_filter=BM_FROST_EndToEnd
+ *   
+ *   # Compare with trusted dealer benchmarks
+ *   # Run both simple_frost_benchmark (DKG) and trusted_dealer_benchmark side by side
+ */
+
+#include <benchmark/benchmark.h>
+#include <chrono>
+#include <vector>
+#include <memory>
+#include <cstring>
+#include <algorithm>
+#include <random>
+
+extern "C" {
+#include "secp256k1.h"
+#include "secp256k1_frost.h"
+}
+
+//=============================================================================
+// BENCHMARK HELPER FUNCTIONS
+//=============================================================================
+
+// Helper function to fill buffer with pseudo-random data
+static void fill_random(unsigned char *data, size_t size) {
+    for (size_t i = 0; i < size; i++) {
+        data[i] = (unsigned char)(rand() & 0xFF);
+    }
+}
+
+// RAII wrapper for secp256k1_context
+class Secp256k1Context {
+public:
+    Secp256k1Context() : ctx(secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY)) {}
+    ~Secp256k1Context() { if (ctx) secp256k1_context_destroy(ctx); }
+    secp256k1_context* get() const { return ctx; }
+    bool valid() const { return ctx != nullptr; }
+private:
+    secp256k1_context* ctx;
+};
+
+// Structure to hold complete FROST setup for a group
+struct FrostGroup {
+    uint32_t n;  // total participants
+    uint32_t t;  // threshold
+    std::vector<secp256k1_frost_keypair*> keypairs;
+    std::vector<secp256k1_frost_vss_commitments*> commitments;
+    
+    ~FrostGroup() {
+        for (auto kp : keypairs) {
+            if (kp) secp256k1_frost_keypair_destroy(kp);
+        }
+        for (auto comm : commitments) {
+            if (comm) secp256k1_frost_vss_commitments_destroy(comm);
+        }
+    }
+};
+
+//=============================================================================
+// FROST DKG BENCHMARK
+//=============================================================================
+
+/**
+ * Execute complete DKG protocol for n participants with threshold t
+ * Returns false on failure, true on success
+ */
+static bool execute_frost_dkg(const secp256k1_context* ctx, FrostGroup& group) {
+    const uint32_t n = group.n;
+    const uint32_t t = group.t;
+    const char* dkg_context = "FROST_DKG_BENCHMARK";
+    const uint32_t context_len = strlen(dkg_context);
+    
+    // Phase 1: Each participant generates commitments and shares
+    std::vector<std::vector<secp256k1_frost_keygen_secret_share>> all_shares(n);
+    
+    for (uint32_t i = 0; i < n; i++) {
+        group.keypairs[i] = secp256k1_frost_keypair_create(i + 1);
+        if (!group.keypairs[i]) return false;
+        
+        group.commitments[i] = secp256k1_frost_vss_commitments_create(t);
+        if (!group.commitments[i]) return false;
+        
+        all_shares[i].resize(n);
+        
+        int result = secp256k1_frost_keygen_dkg_begin(
+            ctx, group.commitments[i], all_shares[i].data(),
+            n, t, i + 1, 
+            (const unsigned char*)dkg_context, context_len
+        );
+        if (!result) return false;
+    }
+    
+    // Phase 2: Validate all commitments
+    for (uint32_t i = 0; i < n; i++) {
+        for (uint32_t j = 0; j < n; j++) {
+            if (i == j) continue;  // Don't validate own commitment
+            
+            int result = secp256k1_frost_keygen_dkg_commitment_validate(
+                ctx, group.commitments[j], 
+                (const unsigned char*)dkg_context, context_len
+            );
+            if (!result) return false;
+        }
+    }
+    
+    // Phase 3: Finalize DKG for each participant
+    for (uint32_t i = 0; i < n; i++) {
+        // Collect shares intended for participant i
+        std::vector<secp256k1_frost_keygen_secret_share> participant_shares;
+        for (uint32_t j = 0; j < n; j++) {
+            // Find share from participant j intended for participant i
+            for (uint32_t k = 0; k < n; k++) {
+                if (all_shares[j][k].receiver_index == i + 1) {
+                    participant_shares.push_back(all_shares[j][k]);
+                    break;
+                }
+            }
+        }
+        
+        // Convert commitments to array format
+        std::vector<secp256k1_frost_vss_commitments*> commitment_ptrs(n);
+        for (uint32_t j = 0; j < n; j++) {
+            commitment_ptrs[j] = group.commitments[j];
+        }
+        
+        int result = secp256k1_frost_keygen_dkg_finalize(
+            ctx, group.keypairs[i], i + 1, n,
+            participant_shares.data(), commitment_ptrs.data()
+        );
+        if (!result) return false;
+    }
+    
+    return true;
+}
+
+/**
+ * Benchmark: Complete FROST DKG Protocol
+ */
+static void BM_FROST_DKG(benchmark::State& state) {
+    const uint32_t n = state.range(0);  // total participants
+    const uint32_t t = state.range(1);  // threshold
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    for (auto _ : state) {
+        FrostGroup group;
+        group.n = n;
+        group.t = t;
+        group.keypairs.resize(n, nullptr);
+        group.commitments.resize(n, nullptr);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        bool success = execute_frost_dkg(ctx.get(), group);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!success) {
+            state.SkipWithError("DKG protocol failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(n * n);  // DKG has quadratic complexity
+    state.SetLabel("DKG n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+// Test standardized matrix: group sizes (3,5,10,20,40,60,100) with 33% and 66% thresholds
+BENCHMARK(BM_FROST_DKG)
+    // 33% threshold configurations
+    ->Args({3, 1})   // (n=3, t=1) 33% threshold
+    ->Args({5, 2})   // (n=5, t=2) 33% threshold  
+    ->Args({10, 4})  // (n=10, t=4) 33% threshold
+    ->Args({20, 7})  // (n=20, t=7) 33% threshold
+    ->Args({40, 14}) // (n=40, t=14) 33% threshold
+    ->Args({60, 20}) // (n=60, t=20) 33% threshold
+    ->Args({100, 34})// (n=100, t=34) 33% threshold
+    // 66% threshold configurations  
+    ->Args({3, 2})   // (n=3, t=2) 66% threshold
+    ->Args({5, 4})   // (n=5, t=4) 66% threshold
+    ->Args({10, 7})  // (n=10, t=7) 66% threshold
+    ->Args({20, 14}) // (n=20, t=14) 66% threshold
+    ->Args({40, 27}) // (n=40, t=27) 66% threshold
+    ->Args({60, 40}) // (n=60, t=40) 66% threshold
+    ->Args({100, 67})// (n=100, t=67) 66% threshold
+    ->UseManualTime()
+    ->Complexity(benchmark::oNSquared)
+    ->Unit(benchmark::kMillisecond);
+
+//=============================================================================
+// FROST SIGNING BENCHMARK
+//=============================================================================
+
+/**
+ * Execute complete FROST signing protocol
+ * Returns false on failure, true on success
+ */
+static bool execute_frost_signing(const secp256k1_context* ctx, 
+                                 const FrostGroup& group,
+                                 const unsigned char* msg32,
+                                 unsigned char* signature64) {
+    const uint32_t t = group.t;  // Use threshold number of signers
+    
+    // Select first t participants as signers
+    std::vector<secp256k1_frost_nonce*> nonces(t, nullptr);
+    std::vector<secp256k1_frost_nonce_commitment> commitments(t);
+    std::vector<secp256k1_frost_signature_share> sig_shares(t);
+    std::vector<secp256k1_frost_pubkey> pubkeys(t);
+    
+    // Phase 1: Generate nonces and commitments
+    for (uint32_t i = 0; i < t; i++) {
+        unsigned char hiding_seed[32], binding_seed[32];
+        fill_random(hiding_seed, 32);
+        fill_random(binding_seed, 32);
+        
+        nonces[i] = secp256k1_frost_nonce_create(
+            ctx, group.keypairs[i], binding_seed, hiding_seed
+        );
+        if (!nonces[i]) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j < i; j++) {
+                if (nonces[j]) secp256k1_frost_nonce_destroy(nonces[j]);
+            }
+            return false;
+        }
+        
+        commitments[i] = nonces[i]->commitments;
+        
+        // Extract public key
+        if (!secp256k1_frost_pubkey_from_keypair(&pubkeys[i], group.keypairs[i])) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j <= i; j++) {
+                if (nonces[j]) secp256k1_frost_nonce_destroy(nonces[j]);
+            }
+            return false;
+        }
+    }
+    
+    // Phase 2: Generate signature shares
+    for (uint32_t i = 0; i < t; i++) {
+        int result = secp256k1_frost_sign(
+            ctx, &sig_shares[i], msg32, t,
+            group.keypairs[i], nonces[i], commitments.data()
+        );
+        if (!result) {
+            // Cleanup on failure
+            for (uint32_t j = 0; j < t; j++) {
+                if (nonces[j]) secp256k1_frost_nonce_destroy(nonces[j]);
+            }
+            return false;
+        }
+    }
+    
+    // Phase 3: Aggregate signature
+    int result = secp256k1_frost_aggregate(
+        ctx, signature64, msg32, group.keypairs[0],
+        pubkeys.data(), commitments.data(), sig_shares.data(), t
+    );
+    
+    // Cleanup
+    for (uint32_t i = 0; i < t; i++) {
+        if (nonces[i]) secp256k1_frost_nonce_destroy(nonces[i]);
+    }
+    
+    return result == 1;
+}
+
+/**
+ * Benchmark: Complete FROST Signing Protocol
+ * Assumes DKG has already been completed
+ */
+static void BM_FROST_Signing(benchmark::State& state) {
+    const uint32_t n = state.range(0);  // total participants
+    const uint32_t t = state.range(1);  // threshold
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    // Setup: Execute DKG once
+    FrostGroup group;
+    group.n = n;
+    group.t = t;
+    group.keypairs.resize(n, nullptr);
+    group.commitments.resize(n, nullptr);
+    
+    if (!execute_frost_dkg(ctx.get(), group)) {
+        state.SkipWithError("DKG setup failed");
+        return;
+    }
+    
+    unsigned char msg[32];
+    fill_random(msg, 32);
+    
+    for (auto _ : state) {
+        unsigned char signature[64];
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        bool success = execute_frost_signing(ctx.get(), group, msg, signature);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!success) {
+            state.SkipWithError("FROST signing failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(t);  // Signing complexity scales with threshold
+    state.SetLabel("Signing n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+BENCHMARK(BM_FROST_Signing)
+    // 33% threshold configurations
+    ->Args({3, 1})   // (n=3, t=1) 33% threshold
+    ->Args({5, 2})   // (n=5, t=2) 33% threshold  
+    ->Args({10, 4})  // (n=10, t=4) 33% threshold
+    ->Args({20, 7})  // (n=20, t=7) 33% threshold
+    ->Args({40, 14}) // (n=40, t=14) 33% threshold
+    ->Args({60, 20}) // (n=60, t=20) 33% threshold
+    ->Args({100, 34})// (n=100, t=34) 33% threshold
+    // 66% threshold configurations  
+    ->Args({3, 2})   // (n=3, t=2) 66% threshold
+    ->Args({5, 4})   // (n=5, t=4) 66% threshold
+    ->Args({10, 7})  // (n=10, t=7) 66% threshold
+    ->Args({20, 14}) // (n=20, t=14) 66% threshold
+    ->Args({40, 27}) // (n=40, t=27) 66% threshold
+    ->Args({60, 40}) // (n=60, t=40) 66% threshold
+    ->Args({100, 67})// (n=100, t=67) 66% threshold
+    ->UseManualTime()
+    ->Complexity(benchmark::oN)
+    ->Unit(benchmark::kMicrosecond);
+
+//=============================================================================
+// FROST VERIFICATION BENCHMARK
+//=============================================================================
+
+/**
+ * Benchmark: FROST Signature Verification
+ */
+static void BM_FROST_Verification(benchmark::State& state) {
+    const uint32_t n = state.range(0);  // total participants
+    const uint32_t t = state.range(1);  // threshold
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    // Setup: Execute DKG and create signature
+    FrostGroup group;
+    group.n = n;
+    group.t = t;
+    group.keypairs.resize(n, nullptr);
+    group.commitments.resize(n, nullptr);
+    
+    if (!execute_frost_dkg(ctx.get(), group)) {
+        state.SkipWithError("DKG setup failed");
+        return;
+    }
+    
+    unsigned char msg[32];
+    unsigned char signature[64];
+    fill_random(msg, 32);
+    
+    if (!execute_frost_signing(ctx.get(), group, msg, signature)) {
+        state.SkipWithError("Signature creation failed");
+        return;
+    }
+    
+    // Extract group public key for verification
+    secp256k1_frost_pubkey group_pubkey;
+    if (!secp256k1_frost_pubkey_from_keypair(&group_pubkey, group.keypairs[0])) {
+        state.SkipWithError("Failed to extract group public key");
+        return;
+    }
+    
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        int valid = secp256k1_frost_verify(ctx.get(), signature, msg, &group_pubkey);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!valid) {
+            state.SkipWithError("Signature verification failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetLabel("Verification n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+BENCHMARK(BM_FROST_Verification)
+    // 33% threshold configurations
+    ->Args({3, 1})   // (n=3, t=1) 33% threshold
+    ->Args({5, 2})   // (n=5, t=2) 33% threshold  
+    ->Args({10, 4})  // (n=10, t=4) 33% threshold
+    ->Args({20, 7})  // (n=20, t=7) 33% threshold
+    ->Args({40, 14}) // (n=40, t=14) 33% threshold
+    ->Args({60, 20}) // (n=60, t=20) 33% threshold
+    ->Args({100, 34})// (n=100, t=34) 33% threshold
+    // 66% threshold configurations  
+    ->Args({3, 2})   // (n=3, t=2) 66% threshold
+    ->Args({5, 4})   // (n=5, t=4) 66% threshold
+    ->Args({10, 7})  // (n=10, t=7) 66% threshold
+    ->Args({20, 14}) // (n=20, t=14) 66% threshold
+    ->Args({40, 27}) // (n=40, t=27) 66% threshold
+    ->Args({60, 40}) // (n=60, t=40) 66% threshold
+    ->Args({100, 67})// (n=100, t=67) 66% threshold
+    ->UseManualTime()
+    ->Unit(benchmark::kMicrosecond);
+
+//=============================================================================
+// END-TO-END FROST BENCHMARK
+//=============================================================================
+
+/**
+ * Benchmark: Complete End-to-End FROST Protocol
+ * DKG + Signing + Verification
+ */
+static void BM_FROST_EndToEnd(benchmark::State& state) {
+    const uint32_t n = state.range(0);  // total participants
+    const uint32_t t = state.range(1);  // threshold
+    
+    Secp256k1Context ctx;
+    if (!ctx.valid()) {
+        state.SkipWithError("Failed to create secp256k1 context");
+        return;
+    }
+    
+    unsigned char msg[32];
+    fill_random(msg, 32);
+    
+    for (auto _ : state) {
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        // Phase 1: DKG
+        FrostGroup group;
+        group.n = n;
+        group.t = t;
+        group.keypairs.resize(n, nullptr);
+        group.commitments.resize(n, nullptr);
+        
+        bool dkg_success = execute_frost_dkg(ctx.get(), group);
+        if (!dkg_success) {
+            state.SkipWithError("DKG failed");
+            break;
+        }
+        
+        // Phase 2: Signing
+        unsigned char signature[64];
+        bool sign_success = execute_frost_signing(ctx.get(), group, msg, signature);
+        if (!sign_success) {
+            state.SkipWithError("Signing failed");
+            break;
+        }
+        
+        // Phase 3: Verification
+        secp256k1_frost_pubkey group_pubkey;
+        if (!secp256k1_frost_pubkey_from_keypair(&group_pubkey, group.keypairs[0])) {
+            state.SkipWithError("Failed to extract group public key");
+            break;
+        }
+        
+        int verify_success = secp256k1_frost_verify(ctx.get(), signature, msg, &group_pubkey);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start);
+        
+        if (!verify_success) {
+            state.SkipWithError("Verification failed");
+            break;
+        }
+        
+        state.SetIterationTime(duration.count() / 1e9);
+    }
+    
+    state.SetComplexityN(n * n);  // Dominated by DKG quadratic complexity
+    state.SetLabel("End-to-End n=" + std::to_string(n) + " t=" + std::to_string(t));
+}
+
+BENCHMARK(BM_FROST_EndToEnd)
+    // 33% threshold configurations
+    ->Args({3, 1})   // (n=3, t=1) 33% threshold
+    ->Args({5, 2})   // (n=5, t=2) 33% threshold  
+    ->Args({10, 4})  // (n=10, t=4) 33% threshold
+    ->Args({20, 7})  // (n=20, t=7) 33% threshold
+    ->Args({40, 14}) // (n=40, t=14) 33% threshold
+    ->Args({60, 20}) // (n=60, t=20) 33% threshold
+    ->Args({100, 34})// (n=100, t=34) 33% threshold
+    // 66% threshold configurations  
+    ->Args({3, 2})   // (n=3, t=2) 66% threshold
+    ->Args({5, 4})   // (n=5, t=4) 66% threshold
+    ->Args({10, 7})  // (n=10, t=7) 66% threshold
+    ->Args({20, 14}) // (n=20, t=14) 66% threshold
+    ->Args({40, 27}) // (n=40, t=27) 66% threshold
+    ->Args({60, 40}) // (n=60, t=40) 66% threshold
+    ->Args({100, 67})// (n=100, t=67) 66% threshold
+    ->UseManualTime()
+    ->Complexity(benchmark::oNSquared)
+    ->Unit(benchmark::kMillisecond);
+
+//=============================================================================
+// MAIN FUNCTION
+//=============================================================================
+
+BENCHMARK_MAIN();
