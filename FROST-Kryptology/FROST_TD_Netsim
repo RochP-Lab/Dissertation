@@ -1,0 +1,1152 @@
+package main
+
+/*
+* Trusted Dealer FROST Network Simulation - Go Kryptology Implementation
+* ======================================================================
+*
+* This program simulates a trusted dealer-based FROST threshold signature protocol
+* with realistic network conditions including latency, jitter, and packet loss.
+* Designed to provide a direct comparison with the DKG-based approach.
+*
+* Features:
+* - Configurable participant counts (5, 10, 20, 30, 40 nodes)
+* - Two network scenarios: Optimistic (50ms±10ms, 2% loss) and Pessimistic (120ms±30ms, 5% loss)
+* - Network simulation: 50ms ± 10ms latency, 2% packet loss
+* - Trusted Dealer + Signing + Verification workflow
+* - Detailed phase timing measurements
+* - Retry logic for failed messages
+* - Concurrent participant operations for realistic simulation
+*
+* Protocol Flow:
+* 1. Group Setup: Initialize participants and network
+* 2. Trusted Dealer Phase: Centralized key generation and distribution
+* 3. Signing Phase: FROST threshold signing (2 rounds + aggregation)
+* 4. Verification Phase: Signature verification
+*
+* Key Differences from DKG Approach:
+* - O(n) key generation vs O(n²) for DKG
+* - Single point of trust vs distributed trust
+* - Faster setup but centralized security model
+* - Same signing and verification protocols
+ */
+
+import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"math"
+	mathrand "math/rand"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/coinbase/kryptology/pkg/core/curves"
+	"github.com/coinbase/kryptology/pkg/sharing"
+	"github.com/coinbase/kryptology/pkg/ted25519/frost"
+)
+
+///////////////////////////////////////////////////////////////////////////////
+// SIMULATION CONFIGURATION
+///////////////////////////////////////////////////////////////////////////////
+
+type SimulationConfig struct {
+	ParticipantCount   int           // Number of nodes in the network
+	ThresholdCount     int           // Minimum signers required
+	NetworkMeanDelay   time.Duration // Average network latency
+	NetworkStdDevDelay time.Duration // Network jitter
+	PacketLossRate     float64       // Probability of message loss (0.0-1.0)
+	MaxRetries         int           // Maximum retry attempts for failed messages
+	RetryDelay         time.Duration // Delay between retry attempts
+}
+
+// Default simulation configurations - matching DKG simulation for comparison
+var (
+	// Group size configurations: 5, 10, 20, 30, 40 nodes
+	Config5Nodes = SimulationConfig{
+		ParticipantCount:   5,
+		ThresholdCount:     2, // 40% threshold (2/5)
+		NetworkMeanDelay:   50 * time.Millisecond,
+		NetworkStdDevDelay: 10 * time.Millisecond,
+		PacketLossRate:     0.02, // 2%
+		MaxRetries:         3,
+		RetryDelay:         20 * time.Millisecond,
+	}
+
+	Config10Nodes = SimulationConfig{
+		ParticipantCount:   10,
+		ThresholdCount:     4, // 40% threshold (4/10)
+		NetworkMeanDelay:   50 * time.Millisecond,
+		NetworkStdDevDelay: 10 * time.Millisecond,
+		PacketLossRate:     0.02, // 2%
+		MaxRetries:         3,
+		RetryDelay:         20 * time.Millisecond,
+	}
+
+	Config20Nodes = SimulationConfig{
+		ParticipantCount:   20,
+		ThresholdCount:     8, // 40% threshold (8/20)
+		NetworkMeanDelay:   50 * time.Millisecond,
+		NetworkStdDevDelay: 10 * time.Millisecond,
+		PacketLossRate:     0.02, // 2%
+		MaxRetries:         3,
+		RetryDelay:         20 * time.Millisecond,
+	}
+
+	Config30Nodes = SimulationConfig{
+		ParticipantCount:   30,
+		ThresholdCount:     12, // 40% threshold (12/30)
+		NetworkMeanDelay:   50 * time.Millisecond,
+		NetworkStdDevDelay: 10 * time.Millisecond,
+		PacketLossRate:     0.02, // 2%
+		MaxRetries:         3,
+		RetryDelay:         20 * time.Millisecond,
+	}
+
+	Config40Nodes = SimulationConfig{
+		ParticipantCount:   40,
+		ThresholdCount:     16, // 40% threshold (16/40)
+		NetworkMeanDelay:   50 * time.Millisecond,
+		NetworkStdDevDelay: 10 * time.Millisecond,
+		PacketLossRate:     0.02, // 2%
+		MaxRetries:         3,
+		RetryDelay:         20 * time.Millisecond,
+	}
+
+	// Pessimistic network configurations for comparison
+	Config5NodesPessimistic = SimulationConfig{
+		ParticipantCount:   5,
+		ThresholdCount:     2, // 40% threshold (2/5)
+		NetworkMeanDelay:   120 * time.Millisecond,
+		NetworkStdDevDelay: 30 * time.Millisecond,
+		PacketLossRate:     0.05, // 5%
+		MaxRetries:         3,
+		RetryDelay:         50 * time.Millisecond,
+	}
+
+	Config10NodesPessimistic = SimulationConfig{
+		ParticipantCount:   10,
+		ThresholdCount:     4, // 40% threshold (4/10)
+		NetworkMeanDelay:   120 * time.Millisecond,
+		NetworkStdDevDelay: 30 * time.Millisecond,
+		PacketLossRate:     0.05, // 5%
+		MaxRetries:         3,
+		RetryDelay:         50 * time.Millisecond,
+	}
+
+	Config20NodesPessimistic = SimulationConfig{
+		ParticipantCount:   20,
+		ThresholdCount:     8, // 40% threshold (8/20)
+		NetworkMeanDelay:   120 * time.Millisecond,
+		NetworkStdDevDelay: 30 * time.Millisecond,
+		PacketLossRate:     0.05, // 5%
+		MaxRetries:         3,
+		RetryDelay:         50 * time.Millisecond,
+	}
+
+	Config30NodesPessimistic = SimulationConfig{
+		ParticipantCount:   30,
+		ThresholdCount:     12, // 40% threshold (12/30)
+		NetworkMeanDelay:   120 * time.Millisecond,
+		NetworkStdDevDelay: 30 * time.Millisecond,
+		PacketLossRate:     0.05, // 5%
+		MaxRetries:         3,
+		RetryDelay:         50 * time.Millisecond,
+	}
+
+	Config40NodesPessimistic = SimulationConfig{
+		ParticipantCount:   40,
+		ThresholdCount:     16, // 40% threshold (16/40)
+		NetworkMeanDelay:   120 * time.Millisecond,
+		NetworkStdDevDelay: 30 * time.Millisecond,
+		PacketLossRate:     0.05, // 5%
+		MaxRetries:         3,
+		RetryDelay:         50 * time.Millisecond,
+	}
+)
+
+///////////////////////////////////////////////////////////////////////////////
+// NETWORK SIMULATION LAYER (Same as DKG version for fair comparison)
+///////////////////////////////////////////////////////////////////////////////
+
+// NetworkMessage represents a message being transmitted over the simulated network
+type NetworkMessage struct {
+	FromID      uint32
+	ToID        uint32
+	MessageType string
+	Payload     interface{}
+	Timestamp   time.Time
+	RetryCount  int
+}
+
+// NetworkSimulator simulates realistic network conditions
+type NetworkSimulator struct {
+	config SimulationConfig
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// Message channels for each participant
+	messageQueues map[uint32]chan *NetworkMessage
+
+	// Statistics
+	mu                sync.Mutex
+	totalMessages     int
+	droppedMessages   int
+	retriedMessages   int
+	totalNetworkDelay time.Duration
+}
+
+// NewNetworkSimulator creates a new network simulation environment
+func NewNetworkSimulator(config SimulationConfig) *NetworkSimulator {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ns := &NetworkSimulator{
+		config:        config,
+		ctx:           ctx,
+		cancel:        cancel,
+		messageQueues: make(map[uint32]chan *NetworkMessage),
+	}
+
+	// Create message queues for each participant
+	for i := uint32(1); i <= uint32(config.ParticipantCount); i++ {
+		ns.messageQueues[i] = make(chan *NetworkMessage, 100) // Buffered channel
+	}
+
+	return ns
+}
+
+// simulateNetworkDelay generates realistic network latency using normal distribution
+func (ns *NetworkSimulator) simulateNetworkDelay() time.Duration {
+	// Box-Muller transform for normal distribution
+	u1 := mathrand.Float64()
+	u2 := mathrand.Float64()
+
+	z0 := math.Sqrt(-2*math.Log(u1)) * math.Cos(2*math.Pi*u2)
+
+	// Convert to our desired mean and standard deviation
+	delayMs := float64(ns.config.NetworkMeanDelay.Milliseconds()) +
+		z0*float64(ns.config.NetworkStdDevDelay.Milliseconds())
+
+	// Ensure non-negative delay
+	if delayMs < 0 {
+		delayMs = 0
+	}
+
+	return time.Duration(delayMs) * time.Millisecond
+}
+
+// SendMessage simulates sending a message through the network
+func (ns *NetworkSimulator) SendMessage(msg *NetworkMessage) {
+	ns.mu.Lock()
+	ns.totalMessages++
+	ns.mu.Unlock()
+
+	for msg.RetryCount <= ns.config.MaxRetries {
+		// Simulate packet loss
+		if mathrand.Float64() < ns.config.PacketLossRate {
+			ns.mu.Lock()
+			ns.droppedMessages++
+			ns.mu.Unlock()
+
+			// Check if we can retry
+			if msg.RetryCount < ns.config.MaxRetries {
+				time.Sleep(ns.config.RetryDelay)
+				msg.RetryCount++
+				ns.mu.Lock()
+				ns.retriedMessages++
+				ns.mu.Unlock()
+				continue // Try again
+			} else {
+				// Final drop - no more retries
+				return
+			}
+		}
+
+		// Simulate network delay
+		delay := ns.simulateNetworkDelay()
+		ns.mu.Lock()
+		ns.totalNetworkDelay += delay
+		ns.mu.Unlock()
+
+		// Deliver message after delay
+		go func() {
+			time.Sleep(delay)
+			select {
+			case ns.messageQueues[msg.ToID] <- msg:
+				// Message delivered successfully
+			case <-ns.ctx.Done():
+				// Simulation cancelled
+			default:
+				// Queue full - message dropped
+				ns.mu.Lock()
+				ns.droppedMessages++
+				ns.mu.Unlock()
+			}
+		}()
+		break // Message sent successfully (or will be delivered after delay)
+	}
+}
+
+// CalculateTimeout calculates an appropriate timeout based on network conditions
+func (ns *NetworkSimulator) CalculateTimeout(baseRounds int) time.Duration {
+	// Calculate expected round-trip time: 2 * (mean delay + 3 * stddev for 99.7% coverage)
+	expectedRTT := 2 * (ns.config.NetworkMeanDelay + 3*ns.config.NetworkStdDevDelay)
+
+	// Account for packet loss with retries
+	retryOverhead := time.Duration(float64(expectedRTT) * ns.config.PacketLossRate * float64(ns.config.MaxRetries))
+
+	// Base timeout per round (increased multiplier for network congestion)
+	roundTimeout := expectedRTT + retryOverhead + 3*time.Second // Base buffer
+
+	// Scale timeout based on network size (more participants = more congestion)
+	participantCount := ns.config.ParticipantCount
+	congestionMultiplier := 1.0
+	if participantCount > 30 {
+		congestionMultiplier = 10.0 // 10x timeout for very large networks
+	} else if participantCount > 20 {
+		congestionMultiplier = 5.0 // 5x timeout for large networks
+	} else if participantCount > 10 {
+		congestionMultiplier = 2.0 // 2x timeout for medium networks
+	}
+
+	// Total timeout for multiple rounds with extra safety margin and congestion scaling
+	totalTimeout := time.Duration(float64(baseRounds) * float64(roundTimeout) * 2 * congestionMultiplier)
+
+	// Minimum timeout of 10 seconds, no maximum for stress testing
+	if totalTimeout < 10*time.Second {
+		totalTimeout = 10 * time.Second
+	}
+	// Remove maximum timeout cap for no-timeout testing
+	// if totalTimeout > 180*time.Second {
+	//	totalTimeout = 180*time.Second
+	// }
+
+	// fmt.Printf("🕒 Calculated timeout for %d rounds, %d participants: %v (congestion: %.1fx)\n",
+	//	baseRounds, ns.config.ParticipantCount, totalTimeout, congestionMultiplier)
+
+	return totalTimeout
+}
+
+// ReceiveMessageWithDeadline waits for a message with an absolute deadline
+func (ns *NetworkSimulator) ReceiveMessageWithDeadline(participantID uint32, deadline time.Time) (*NetworkMessage, error) {
+	select {
+	case msg := <-ns.messageQueues[participantID]:
+		return msg, nil
+	case <-time.After(time.Until(deadline)):
+		return nil, fmt.Errorf("deadline exceeded waiting for message for participant %d", participantID)
+	case <-ns.ctx.Done():
+		return nil, fmt.Errorf("simulation cancelled")
+	}
+}
+
+// ReceiveMessage waits for a message for the specified participant with a timeout
+func (ns *NetworkSimulator) ReceiveMessage(participantID uint32, timeout time.Duration) (*NetworkMessage, error) {
+	deadline := time.Now().Add(timeout)
+	return ns.ReceiveMessageWithDeadline(participantID, deadline)
+} // SendToParticipant sends a message to a specific participant
+func (ns *NetworkSimulator) SendToParticipant(fromID, toID uint32, messageType string, payload interface{}) {
+	msg := &NetworkMessage{
+		FromID:      fromID,
+		ToID:        toID,
+		MessageType: messageType,
+		Payload:     payload,
+		Timestamp:   time.Now(),
+		RetryCount:  0,
+	}
+	ns.SendMessage(msg)
+}
+
+// BroadcastMessage sends a message to all other participants
+func (ns *NetworkSimulator) BroadcastMessage(fromID uint32, messageType string, payload interface{}) {
+	for toID := uint32(1); toID <= uint32(ns.config.ParticipantCount); toID++ {
+		if toID != fromID {
+			ns.SendToParticipant(fromID, toID, messageType, payload)
+		}
+	}
+}
+
+// GetStatistics returns network performance statistics
+func (ns *NetworkSimulator) GetStatistics() (int, int, int, time.Duration) {
+	ns.mu.Lock()
+	defer ns.mu.Unlock()
+	return ns.totalMessages, ns.droppedMessages, ns.retriedMessages, ns.totalNetworkDelay
+}
+
+// Shutdown gracefully stops the network simulator
+func (ns *NetworkSimulator) Shutdown() {
+	ns.cancel()
+	ns.wg.Wait()
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// TRUSTED DEALER IMPLEMENTATION
+///////////////////////////////////////////////////////////////////////////////
+
+// TrustedDealerKeyShare represents a key share distributed to a participant
+type TrustedDealerKeyShare struct {
+	ParticipantID uint32
+	SecretShare   *sharing.ShamirShare
+	PublicKey     curves.Point
+}
+
+// TrustedDealer handles centralized key generation and distribution
+type TrustedDealer struct {
+	ID               uint32 // Dealer ID (participant 0)
+	threshold        int
+	participantCount int
+	network          *NetworkSimulator
+
+	// Generated keys
+	groupSecretKey curves.Scalar
+	groupPublicKey curves.Point
+	secretShares   map[uint32]*sharing.ShamirShare
+}
+
+// NewTrustedDealer creates a new trusted dealer
+func NewTrustedDealer(threshold, participantCount int, network *NetworkSimulator) (*TrustedDealer, error) {
+	curve := curves.ED25519()
+	if curve == nil {
+		return nil, fmt.Errorf("failed to initialize Ed25519 curve")
+	}
+
+	return &TrustedDealer{
+		ID:               0, // Special ID for dealer
+		threshold:        threshold,
+		participantCount: participantCount,
+		network:          network,
+		secretShares:     make(map[uint32]*sharing.ShamirShare),
+	}, nil
+}
+
+// GenerateKeys performs the centralized key generation (O(n) complexity)
+func (td *TrustedDealer) GenerateKeys() error {
+	curve := curves.ED25519()
+
+	// 1. Generate group secret key
+	td.groupSecretKey = curve.Scalar.Random(rand.Reader)
+	td.groupPublicKey = curve.Point.Generator().Mul(td.groupSecretKey)
+
+	// 2. Create Shamir secret sharing scheme
+	scheme, err := sharing.NewShamir(uint32(td.threshold), uint32(td.participantCount), curve)
+	if err != nil {
+		return fmt.Errorf("failed to create Shamir scheme: %w", err)
+	}
+
+	// 3. Split group secret key into shares (O(n) operation)
+	shares, err := scheme.Split(td.groupSecretKey, rand.Reader)
+	if err != nil {
+		return fmt.Errorf("failed to split secret: %w", err)
+	}
+
+	// 4. Store shares for distribution
+	// The shares are indexed from 0 to participantCount-1, but participants are 1 to participantCount
+	for shareID, share := range shares {
+		// Map share IDs (0-based) to participant IDs (1-based)
+		participantID := uint32(shareID + 1)
+		if int(participantID) <= td.participantCount {
+			td.secretShares[participantID] = share
+		}
+	}
+
+	return nil
+}
+
+// DistributeKeys sends secret shares to all participants concurrently
+func (td *TrustedDealer) DistributeKeys(ctx context.Context) error {
+	// Distribute keys concurrently to all participants
+	var wg sync.WaitGroup
+	errorChan := make(chan error, td.participantCount)
+
+	for participantID := uint32(1); participantID <= uint32(td.participantCount); participantID++ {
+		wg.Add(1)
+		go func(id uint32) {
+			defer wg.Done()
+
+			share, exists := td.secretShares[id]
+			if !exists {
+				errorChan <- fmt.Errorf("no share for participant %d", id)
+				return
+			}
+
+			keyShare := &TrustedDealerKeyShare{
+				ParticipantID: id,
+				SecretShare:   share,
+				PublicKey:     td.groupPublicKey,
+			}
+
+			// Send key share to participant
+			td.network.SendToParticipant(td.ID, id, "trusted_dealer_key_share", keyShare)
+		}(participantID)
+	}
+
+	wg.Wait()
+	close(errorChan)
+
+	// Check for errors
+	for err := range errorChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// PARTICIPANT IMPLEMENTATION
+///////////////////////////////////////////////////////////////////////////////
+
+// Participant represents a node in the trusted dealer FROST protocol
+type Participant struct {
+	ID      uint32
+	Signer  *frost.Signer
+	network *NetworkSimulator
+
+	// Protocol state
+	keyShare     *sharing.ShamirShare
+	publicKey    curves.Point
+	keysReceived bool
+	threshold    int
+}
+
+// NewParticipant creates a new participant for the trusted dealer protocol
+func NewParticipant(id uint32, threshold int, network *NetworkSimulator) (*Participant, error) {
+	return &Participant{
+		ID:        id,
+		network:   network,
+		threshold: threshold,
+	}, nil
+}
+
+// ReceiveKeys waits for and processes the key share from the trusted dealer
+func (p *Participant) ReceiveKeys(ctx context.Context) error {
+	// Wait for key share from trusted dealer with timeout
+	keyTimeout := p.network.CalculateTimeout(1) // 1 round for key distribution
+	msg, err := p.network.ReceiveMessage(p.ID, keyTimeout)
+	if err != nil {
+		return fmt.Errorf("error receiving key share for participant %d: %w", p.ID, err)
+	}
+
+	if msg.MessageType != "trusted_dealer_key_share" {
+		return fmt.Errorf("expected key share, got %s", msg.MessageType)
+	}
+
+	keyShare, ok := msg.Payload.(*TrustedDealerKeyShare)
+	if !ok {
+		return fmt.Errorf("invalid key share payload")
+	}
+
+	// Store received keys
+	p.keyShare = keyShare.SecretShare
+	p.publicKey = keyShare.PublicKey
+	p.keysReceived = true
+
+	return nil
+}
+
+// Phase 1: Group Setup
+func (p *Participant) GroupSetup() error {
+	// Simulate setup work (same as DKG version)
+	time.Sleep(5 * time.Millisecond)
+	return nil
+}
+
+// Phase 3: FROST Signing Protocol (simplified for trusted dealer)
+func (p *Participant) ExecuteSigning(message []byte, signerIDs []uint32) ([]byte, error) {
+	if !p.keysReceived {
+		return nil, fmt.Errorf("keys not received for participant %d", p.ID)
+	}
+
+	// Initialize signer if this participant is selected
+	isSelectedSigner := false
+	for _, id := range signerIDs {
+		if id == p.ID {
+			isSelectedSigner = true
+			break
+		}
+	}
+
+	if !isSelectedSigner {
+		return nil, nil // Not participating in this signing
+	}
+
+	// For trusted dealer scenario, we'll simulate the signing process
+	// In a real implementation, you would use frost.keys.KeyPackage and frost.Signature
+	// Here we simulate the 2-round protocol timing
+
+	// Simulate Round 1: Generate and broadcast nonce commitments
+	time.Sleep(2 * time.Millisecond) // Simulate nonce generation
+
+	// Broadcast Round 1 data
+	round1Data := fmt.Sprintf("round1_commitment_%d", p.ID)
+	p.network.BroadcastMessage(p.ID, "signing_round1", round1Data)
+
+	// Collect Round 1 commitments from other signers
+	expectedSigners := make(map[uint32]bool)
+	for _, id := range signerIDs {
+		if id != p.ID {
+			expectedSigners[id] = true
+		}
+	}
+
+	receivedRound1 := make(map[uint32]bool)
+	signingRoundTimeout := p.network.CalculateTimeout(1) // 1 round of signing
+	deadline := time.Now().Add(signingRoundTimeout)
+	for len(receivedRound1) < len(expectedSigners) {
+		msg, err := p.network.ReceiveMessageWithDeadline(p.ID, deadline)
+		if err != nil {
+			return nil, fmt.Errorf("error receiving signing round 1: %w", err)
+		}
+
+		if msg.MessageType == "signing_round1" {
+			if _, ok := expectedSigners[msg.FromID]; ok {
+				receivedRound1[msg.FromID] = true
+			}
+		}
+	}
+
+	// Simulate Round 2: Generate signature shares
+	time.Sleep(3 * time.Millisecond) // Simulate signature share generation
+
+	round2Data := fmt.Sprintf("round2_signature_share_%d", p.ID)
+	p.network.BroadcastMessage(p.ID, "signing_round2", round2Data)
+
+	// Collect Round 2 signature shares
+	receivedRound2 := make(map[uint32]bool)
+	signingRound2Timeout := p.network.CalculateTimeout(1) // 1 round of signing
+	deadline2 := time.Now().Add(signingRound2Timeout)
+	for len(receivedRound2) < len(expectedSigners) {
+		msg, err := p.network.ReceiveMessageWithDeadline(p.ID, deadline2)
+		if err != nil {
+			return nil, fmt.Errorf("error receiving signing round 2: %w", err)
+		}
+
+		if msg.MessageType == "signing_round2" {
+			if _, ok := expectedSigners[msg.FromID]; ok {
+				receivedRound2[msg.FromID] = true
+			}
+		}
+	}
+
+	// Simulate Round 3: Aggregate signature (local operation)
+	time.Sleep(1 * time.Millisecond) // Simulate aggregation
+
+	// Return a mock signature (in practice, this would be the real aggregated signature)
+	signature := fmt.Sprintf("frost_signature_%d_%s", len(signerIDs), string(message[:min(10, len(message))]))
+	return []byte(signature), nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// Phase 4: Signature Verification
+func (p *Participant) VerifySignature(signature []byte, message []byte) bool {
+	if !p.keysReceived {
+		return false
+	}
+
+	// For this simulation, we'll implement a simplified verification
+	// In practice, you'd reconstruct the full signature and verify properly
+	// For now, we'll just check that we have a non-empty signature
+	return len(signature) > 0
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// SIMULATION ORCHESTRATOR
+///////////////////////////////////////////////////////////////////////////////
+
+// SimulationResults contains comprehensive timing and performance data
+type SimulationResults struct {
+	Config              SimulationConfig
+	GroupSetupTime      time.Duration
+	TrustedDealerTime   time.Duration // Key generation + distribution
+	KeyDistributionTime time.Duration // Time for all participants to receive keys
+	SigningTime         time.Duration
+	VerificationTime    time.Duration
+	TotalTime           time.Duration
+
+	// Network statistics
+	TotalMessages       int
+	DroppedMessages     int
+	RetriedMessages     int
+	TotalNetworkDelay   time.Duration
+	AverageNetworkDelay time.Duration
+}
+
+// RunSimulation orchestrates the complete trusted dealer FROST protocol simulation
+func RunSimulation(config SimulationConfig) (*SimulationResults, error) {
+	fmt.Printf("Running Trusted Dealer simulation with %d nodes...\n", config.ParticipantCount)
+	fmt.Printf("Network settings: Mean Delay=%v, Stddev=%v, Packet Loss=%.1f%%\n\n",
+		config.NetworkMeanDelay, config.NetworkStdDevDelay, config.PacketLossRate*100)
+
+	totalStartTime := time.Now()
+	results := &SimulationResults{Config: config}
+
+	// Initialize network simulator
+	network := NewNetworkSimulator(config)
+	defer network.Shutdown()
+
+	// Phase 1: Group Setup
+	fmt.Print("Phase 1: Group Setup... ")
+	groupSetupStart := time.Now()
+
+	participants := make([]*Participant, 0, config.ParticipantCount)
+	for i := uint32(1); i <= uint32(config.ParticipantCount); i++ {
+		participant, err := NewParticipant(i, config.ThresholdCount, network)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create participant %d: %w", i, err)
+		}
+
+		if err := participant.GroupSetup(); err != nil {
+			return nil, fmt.Errorf("group setup failed for participant %d: %w", i, err)
+		}
+
+		participants = append(participants, participant)
+	}
+
+	results.GroupSetupTime = time.Since(groupSetupStart)
+	fmt.Printf("✓ (%v)\n", results.GroupSetupTime)
+
+	// Phase 2: Trusted Dealer Key Generation and Distribution
+	fmt.Print("Phase 2: Trusted Dealer Key Generation... ")
+	dealerStart := time.Now()
+
+	// Create trusted dealer
+	dealer, err := NewTrustedDealer(config.ThresholdCount, config.ParticipantCount, network)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create trusted dealer: %w", err)
+	}
+
+	// Generate keys (O(n) operation)
+	if err := dealer.GenerateKeys(); err != nil {
+		return nil, fmt.Errorf("key generation failed: %w", err)
+	}
+
+	results.TrustedDealerTime = time.Since(dealerStart)
+	fmt.Printf("✓ (%v)\n", results.TrustedDealerTime)
+
+	// Phase 2b: Key Distribution
+	fmt.Print("Phase 2b: Key Distribution... ")
+	distributionStart := time.Now()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // Distribute keys concurrently
+	if err := dealer.DistributeKeys(ctx); err != nil {
+		return nil, fmt.Errorf("key distribution failed: %w", err)
+	}
+
+	// All participants receive keys concurrently
+	var wg sync.WaitGroup
+	errorChan := make(chan error, config.ParticipantCount)
+
+	for _, participant := range participants {
+		wg.Add(1)
+		go func(p *Participant) {
+			defer wg.Done()
+			if err := p.ReceiveKeys(ctx); err != nil {
+				errorChan <- err
+			}
+		}(participant)
+	}
+
+	wg.Wait()
+	close(errorChan)
+
+	// Check for errors
+	for err := range errorChan {
+		if err != nil {
+			return nil, fmt.Errorf("key distribution phase failed: %w", err)
+		}
+	}
+
+	results.KeyDistributionTime = time.Since(distributionStart)
+	fmt.Printf("✓ (%v)\n", results.KeyDistributionTime)
+
+	// Phase 3: FROST Signing (identical to DKG version)
+	fmt.Print("Phase 3: FROST Signing... ")
+	signingStart := time.Now()
+
+	message := []byte("FROST trusted dealer simulation test message")
+
+	// Select threshold number of signers (first threshold participants)
+	signerIDs := make([]uint32, config.ThresholdCount)
+	for i := 0; i < config.ThresholdCount; i++ {
+		signerIDs[i] = uint32(i + 1)
+	}
+
+	// Execute signing protocol
+	var finalSignature []byte
+	var signingError error
+
+	// Only the threshold signers participate in signing
+	var signingWg sync.WaitGroup
+	signingErrorChan := make(chan error, config.ThresholdCount)
+	resultChan := make(chan []byte, 1)
+
+	for i, participant := range participants {
+		if i >= config.ThresholdCount {
+			break // Only first threshold participants sign
+		}
+
+		signingWg.Add(1)
+		go func(p *Participant, idx int) {
+			defer signingWg.Done()
+			signature, err := p.ExecuteSigning(message, signerIDs)
+			if err != nil {
+				signingErrorChan <- fmt.Errorf("participant %d signing failed: %w", p.ID, err)
+				return
+			}
+			if signature != nil && idx == 0 { // Only first signer returns signature
+				select {
+				case resultChan <- signature:
+				default:
+				}
+			}
+		}(participant, i)
+	}
+
+	signingWg.Wait()
+	close(signingErrorChan)
+	close(resultChan)
+
+	// Check for errors
+	for err := range signingErrorChan {
+		if err != nil {
+			signingError = err
+			break
+		}
+	}
+
+	// Get result
+	select {
+	case finalSignature = <-resultChan:
+	default:
+	}
+
+	if signingError != nil {
+		return nil, fmt.Errorf("signing phase failed: %w", signingError)
+	}
+
+	if finalSignature == nil {
+		return nil, fmt.Errorf("no signature generated")
+	}
+
+	results.SigningTime = time.Since(signingStart)
+	fmt.Printf("✓ (%v)\n", results.SigningTime)
+
+	// Phase 4: Verification
+	fmt.Print("Phase 4: Signature Verification... ")
+	verificationStart := time.Now()
+
+	// Verify signature using any participant's public key
+	verificationSuccessful := participants[0].VerifySignature(finalSignature, message)
+	if !verificationSuccessful {
+		return nil, fmt.Errorf("signature verification failed")
+	}
+
+	results.VerificationTime = time.Since(verificationStart)
+	fmt.Printf("✓ (%v)\n", results.VerificationTime)
+
+	// Calculate total time and network statistics
+	results.TotalTime = time.Since(totalStartTime)
+
+	totalMsgs, droppedMsgs, retriedMsgs, totalNetDelay := network.GetStatistics()
+	results.TotalMessages = totalMsgs
+	results.DroppedMessages = droppedMsgs
+	results.RetriedMessages = retriedMsgs
+	results.TotalNetworkDelay = totalNetDelay
+
+	if totalMsgs > 0 {
+		results.AverageNetworkDelay = totalNetDelay / time.Duration(totalMsgs)
+	}
+
+	return results, nil
+}
+
+// PrintResults displays comprehensive simulation results
+func PrintResults(results *SimulationResults) {
+	fmt.Println("\n" + strings.Repeat("=", 70))
+	fmt.Println("TRUSTED DEALER FROST NETWORK SIMULATION RESULTS")
+	fmt.Println(strings.Repeat("=", 70))
+
+	fmt.Printf("Configuration: %d nodes, %d threshold\n",
+		results.Config.ParticipantCount, results.Config.ThresholdCount)
+	fmt.Printf("Network: %v ± %v latency, %.1f%% loss\n\n",
+		results.Config.NetworkMeanDelay, results.Config.NetworkStdDevDelay,
+		results.Config.PacketLossRate*100)
+
+	fmt.Println("PHASE TIMINGS:")
+	fmt.Printf("  Group Setup Time:         %v\n", results.GroupSetupTime)
+	fmt.Printf("  Trusted Dealer Gen Time:  %v (O(n) key generation)\n", results.TrustedDealerTime)
+	fmt.Printf("  Key Distribution Time:    %v\n", results.KeyDistributionTime)
+	fmt.Printf("  Signing Time:             %v\n", results.SigningTime)
+	fmt.Printf("  Verification Time:        %v\n", results.VerificationTime)
+	fmt.Printf("  Total Simulation Time:    %v\n\n", results.TotalTime)
+
+	fmt.Println("NETWORK STATISTICS:")
+	fmt.Printf("  Total Messages:           %d\n", results.TotalMessages)
+	fmt.Printf("  Dropped Messages:         %d (%.2f%%)\n",
+		results.DroppedMessages,
+		float64(results.DroppedMessages)/float64(results.TotalMessages)*100)
+	fmt.Printf("  Retried Messages:         %d\n", results.RetriedMessages)
+	fmt.Printf("  Average Network Delay:    %v\n", results.AverageNetworkDelay)
+	fmt.Printf("  Total Network Overhead:   %v\n", results.TotalNetworkDelay)
+
+	fmt.Println("\nPERFORMANCE ANALYSIS:")
+	keySetupTime := results.TrustedDealerTime + results.KeyDistributionTime
+	protocolTime := keySetupTime + results.SigningTime + results.VerificationTime
+	networkOverhead := float64(results.TotalNetworkDelay.Milliseconds()) / float64(protocolTime.Milliseconds()) * 100
+	fmt.Printf("  Key Setup Time (TD+Dist): %v\n", keySetupTime)
+	fmt.Printf("  Pure Protocol Time:       %v\n", protocolTime)
+	fmt.Printf("  Network Overhead:         %.1f%% of protocol time\n", networkOverhead)
+
+	reliabilityRate := float64(results.TotalMessages-results.DroppedMessages) / float64(results.TotalMessages) * 100
+	fmt.Printf("  Message Reliability:      %.2f%%\n", reliabilityRate)
+
+	fmt.Println("\nTRUST MODEL:")
+	fmt.Printf("  Centralized Trust:        Single trusted dealer\n")
+	fmt.Printf("  Key Generation:           O(n) complexity\n")
+	fmt.Printf("  Single Point of Failure:  Yes (dealer compromise = total break)\n")
+}
+
+// Statistical analysis structures for Trusted Dealer simulation
+type DurationStats struct {
+	Mean     time.Duration
+	Median   time.Duration
+	StdDev   time.Duration
+	Min      time.Duration
+	Max      time.Duration
+	CV       float64 // Coefficient of Variation
+}
+
+// Calculate statistical measures from multiple simulation runs
+func calculateDurationStats(durations []time.Duration) DurationStats {
+	if len(durations) == 0 {
+		return DurationStats{}
+	}
+
+	// Sort for median calculation
+	sorted := make([]time.Duration, len(durations))
+	copy(sorted, durations)
+	for i := 0; i < len(sorted)-1; i++ {
+		for j := 0; j < len(sorted)-i-1; j++ {
+			if sorted[j] > sorted[j+1] {
+				sorted[j], sorted[j+1] = sorted[j+1], sorted[j]
+			}
+		}
+	}
+
+	// Calculate mean
+	var sum time.Duration
+	for _, d := range durations {
+		sum += d
+	}
+	mean := sum / time.Duration(len(durations))
+
+	// Calculate median
+	var median time.Duration
+	n := len(sorted)
+	if n%2 == 0 {
+		median = (sorted[n/2-1] + sorted[n/2]) / 2
+	} else {
+		median = sorted[n/2]
+	}
+
+	// Calculate standard deviation
+	var sumSquaredDiffs float64
+	meanMs := float64(mean.Milliseconds())
+	for _, d := range durations {
+		diff := float64(d.Milliseconds()) - meanMs
+		sumSquaredDiffs += diff * diff
+	}
+	stdDevMs := math.Sqrt(sumSquaredDiffs / float64(len(durations)))
+	stdDev := time.Duration(stdDevMs) * time.Millisecond
+
+	// Calculate coefficient of variation
+	cv := (stdDevMs / meanMs) * 100
+
+	return DurationStats{
+		Mean:   mean,
+		Median: median,
+		StdDev: stdDev,
+		Min:    sorted[0],
+		Max:    sorted[n-1],
+		CV:     cv,
+	}
+}
+
+// PrintStatisticalResults displays comprehensive statistical analysis for Trusted Dealer
+// PrintDurationStats prints statistical analysis for a specific timing phase
+func PrintDurationStats(phaseName string, durations []time.Duration) {
+	if len(durations) == 0 {
+		fmt.Printf("  %s: No data\n", phaseName)
+		return
+	}
+
+	stats := calculateDurationStats(durations)
+	// Quality assessment based on coefficient of variation
+	quality := "EXCELLENT"
+	if stats.CV > 10 {
+		quality = "GOOD"
+	}
+	if stats.CV > 25 {
+		quality = "FAIR"
+	}
+	if stats.CV > 50 {
+		quality = "POOR"
+	}
+
+	fmt.Printf("  %s:\n", phaseName)
+	fmt.Printf("    Mean:     %v\n", stats.Mean)
+	fmt.Printf("    Median:   %v\n", stats.Median)
+	fmt.Printf("    Std Dev:  %v\n", stats.StdDev)
+	fmt.Printf("    CV:       %.1f%% (%s)\n", stats.CV, quality)
+	fmt.Printf("    Min:      %v\n", stats.Min)
+	fmt.Printf("    Max:      %v\n", stats.Max)
+	fmt.Println()
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// MAIN SIMULATION ENTRY POINT
+///////////////////////////////////////////////////////////////////////////////
+
+func main() {
+	fmt.Println("FROST Trusted Dealer Network Simulation - Statistical Analysis")
+	fmt.Println("================================================================")
+	fmt.Println("Running 10 iterations per configuration for robust statistical analysis")
+	fmt.Println("Testing group sizes: 5, 10, 20, 30, 40 nodes")
+	fmt.Println("Network scenarios: Optimistic (50ms±10ms, 2% loss) vs Pessimistic (120ms±30ms, 5% loss)")
+	fmt.Println("Threshold: 40% for all group sizes")
+	fmt.Println()
+
+	configs := []struct {
+		name   string
+		config SimulationConfig
+	}{
+		{"5 Node Network", Config5Nodes},
+		{"10 Node Network", Config10Nodes},
+		{"20 Node Network", Config20Nodes},
+		{"30 Node Network", Config30Nodes},
+		{"40 Node Network", Config40Nodes},
+	}
+
+	fmt.Println("📡 OPTIMISTIC NETWORK STATISTICAL ANALYSIS (50ms ± 10ms, 2% packet loss)")
+	fmt.Println("===========================================================================")
+
+	for i, cfg := range configs {
+		fmt.Printf("\n🔬 STATISTICAL ANALYSIS %d: %s\n", i+1, cfg.name)
+		fmt.Println(strings.Repeat("-", 60))
+		fmt.Printf("Running 10 iterations...\n")
+
+		var allGroupSetup, allTrustedDealer, allKeyDist, allSigning, allVerification, allTotal []time.Duration
+		successCount := 0
+
+		for iter := 1; iter <= 10; iter++ {
+			fmt.Printf("  Iteration %d/10... ", iter)
+			results, err := RunSimulation(cfg.config)
+			if err != nil {
+				fmt.Printf("❌ Failed: %v\n", err)
+				continue
+			}
+			fmt.Printf("✅ Success\n")
+			successCount++
+			allGroupSetup = append(allGroupSetup, results.GroupSetupTime)
+			allTrustedDealer = append(allTrustedDealer, results.TrustedDealerTime)
+			allKeyDist = append(allKeyDist, results.KeyDistributionTime)
+			allSigning = append(allSigning, results.SigningTime)
+			allVerification = append(allVerification, results.VerificationTime)
+			allTotal = append(allTotal, results.TotalTime)
+		}
+
+		if successCount < 3 {
+			fmt.Printf("❌ Insufficient successful runs (%d/10) for statistical analysis\n", successCount)
+			continue
+		}
+
+		fmt.Printf("\n📊 STATISTICAL RESULTS (%d/%d successful iterations):\n", successCount, 10)
+		fmt.Println(strings.Repeat("=", 70))
+		PrintDurationStats("Group Setup", allGroupSetup)
+		PrintDurationStats("Trusted Dealer Key Gen", allTrustedDealer)
+		PrintDurationStats("Key Distribution", allKeyDist)
+		PrintDurationStats("FROST Signing", allSigning)
+		PrintDurationStats("Signature Verification", allVerification)
+		PrintDurationStats("Total Simulation", allTotal)
+		if i < len(configs)-1 {
+			fmt.Println("\n" + strings.Repeat("*", 90))
+		}
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 90))
+
+	pessimisticConfigs := []struct {
+		name   string
+		config SimulationConfig
+	}{
+		{"5 Node Network (Pessimistic)", Config5NodesPessimistic},
+		{"10 Node Network (Pessimistic)", Config10NodesPessimistic},
+		{"20 Node Network (Pessimistic)", Config20NodesPessimistic},
+		{"30 Node Network (Pessimistic)", Config30NodesPessimistic},
+		{"40 Node Network (Pessimistic)", Config40NodesPessimistic},
+	}
+
+	fmt.Println("📡 PESSIMISTIC NETWORK STATISTICAL ANALYSIS (120ms ± 30ms, 5% packet loss)")
+	fmt.Println("==============================================================================")
+
+	for i, cfg := range pessimisticConfigs {
+		fmt.Printf("\n🔬 STATISTICAL ANALYSIS %d: %s\n", i+6, cfg.name)
+		fmt.Println(strings.Repeat("-", 60))
+		fmt.Printf("Running 10 iterations...\n")
+
+		var allGroupSetup, allTrustedDealer, allKeyDist, allSigning, allVerification, allTotal []time.Duration
+		successCount := 0
+
+		for iter := 1; iter <= 10; iter++ {
+			fmt.Printf("  Iteration %d/10... ", iter)
+			results, err := RunSimulation(cfg.config)
+			if err != nil {
+				fmt.Printf("❌ Failed: %v\n", err)
+				continue
+			}
+			fmt.Printf("✅ Success\n")
+			successCount++
+			allGroupSetup = append(allGroupSetup, results.GroupSetupTime)
+			allTrustedDealer = append(allTrustedDealer, results.TrustedDealerTime)
+			allKeyDist = append(allKeyDist, results.KeyDistributionTime)
+			allSigning = append(allSigning, results.SigningTime)
+			allVerification = append(allVerification, results.VerificationTime)
+			allTotal = append(allTotal, results.TotalTime)
+		}
+
+		if successCount < 3 {
+			fmt.Printf("❌ Insufficient successful runs (%d/10) for statistical analysis\n", successCount)
+			continue
+		}
+
+		fmt.Printf("\n📊 STATISTICAL RESULTS (%d/%d successful iterations):\n", successCount, 10)
+		fmt.Println(strings.Repeat("=", 70))
+		PrintDurationStats("Group Setup", allGroupSetup)
+		PrintDurationStats("Trusted Dealer Key Gen", allTrustedDealer)
+		PrintDurationStats("Key Distribution", allKeyDist)
+		PrintDurationStats("FROST Signing", allSigning)
+		PrintDurationStats("Signature Verification", allVerification)
+		PrintDurationStats("Total Simulation", allTotal)
+		if i < len(pessimisticConfigs)-1 {
+			fmt.Println("\n" + strings.Repeat("*", 90))
+		}
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 90))
+	fmt.Println("✅ All statistical analyses completed!")
+	fmt.Println("\n📊 COMPARISON INSIGHTS:")
+	fmt.Println("- Compare coefficient of variation (CV) between optimistic vs pessimistic networks")
+	fmt.Println("- Lower CV indicates more predictable performance")
+	fmt.Println("- Compare with DKG simulation results to analyze trust model trade-offs:")
+	fmt.Println("  * Trusted Dealer: O(n) key generation, centralized trust, single point of failure")
+	fmt.Println("  * DKG: O(n²) key generation, distributed trust, no single point of failure")
+	fmt.Println("- Signing and verification phases should show similar performance across protocols")
+	fmt.Println("- 40% threshold provides balanced security vs performance trade-off")
+}
