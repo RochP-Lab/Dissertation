@@ -1,0 +1,294 @@
+/*
+ * BLSTTC Threshold Network Simulation - Comprehensive Benchmarks
+ * =============================================================
+ *
+ * This benchmark suite provides comprehensive testing of BLSTTC threshold
+ * signatures with realistic network conditions, generating data compatible
+ * with tabular analysis and comparison with other implementations.
+ *
+ * Features:
+ * - Multiple group sizes (5, 10, 20, 30, 40 participants)
+ * - Configurable threshold percentages
+ * - Two network conditions (best case, worst case)
+ * - Statistical analysis with CV calculations
+ * - JSON and CSV output formats
+ * - Command-line configuration
+ */
+
+use blsttc_threshold_netsim::*;
+use clap::{Args, Parser, Subcommand};
+use serde_json;
+use std::fs::File;
+use std::io::Write;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Run full benchmark suite
+    Full(FullArgs),
+    /// Run single configuration
+    Single(SingleArgs),
+    /// Generate comparison tables
+    Compare(CompareArgs),
+}
+
+#[derive(Args)]
+struct FullArgs {
+    /// Number of iterations per configuration
+    #[arg(short, long, default_value_t = 10)]
+    iterations: usize,
+    
+    /// Output file for JSON results
+    #[arg(short, long)]
+    output: Option<String>,
+    
+    /// Maximum group size to test
+    #[arg(long, default_value_t = 40)]
+    max_nodes: usize,
+    
+    /// Threshold percentage (0.0 to 1.0)
+    #[arg(long, default_value_t = 0.4)]
+    threshold: f64,
+}
+
+#[derive(Args)]
+struct SingleArgs {
+    /// Number of nodes
+    #[arg(short, long)]
+    nodes: usize,
+    
+    /// Threshold percentage (0.0 to 1.0)
+    #[arg(short, long, default_value_t = 0.4)]
+    threshold: f64,
+    
+    /// Network condition (best/worst)
+    #[arg(long, default_value = "best")]
+    network: String,
+    
+    /// Number of iterations
+    #[arg(short, long, default_value_t = 10)]
+    iterations: usize,
+}
+
+#[derive(Args)]
+struct CompareArgs {
+    /// Input JSON file with results
+    #[arg(short, long)]
+    input: String,
+    
+    /// Output format (table/csv)
+    #[arg(short, long, default_value = "table")]
+    format: String,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Full(args) => run_full_benchmark(args).await?,
+        Commands::Single(args) => run_single_benchmark(args).await?,
+        Commands::Compare(args) => generate_comparison(args)?,
+    }
+
+    Ok(())
+}
+
+async fn run_full_benchmark(args: FullArgs) -> anyhow::Result<()> {
+    println!("BLSTTC Comprehensive Benchmark Suite with True DKG");
+    println!("==================================================");
+
+    // Group sizes to test (as specified: 5, 10, 20, 40)
+    let group_sizes = vec![5, 10, 20, 40];
+
+    // Network configurations
+    let network_configs = vec![
+        create_best_case_network(),
+        create_worst_case_network(),
+    ];
+
+    let mut all_results = Vec::new();
+
+    for network_config in network_configs {
+        println!("\n{}", network_config.name);
+        println!("{}", "=".repeat(network_config.name.len()));
+
+        let mut network_results = Vec::new();
+
+        for &nodes in &group_sizes {
+            println!("Testing {} nodes with True DKG...", nodes);
+            
+            match run_benchmark(nodes, args.threshold, network_config.clone(), args.iterations).await {
+                Ok(result) => {
+                    network_results.push(result.clone());
+                    print_single_result(&result);
+                }
+                Err(e) => {
+                    eprintln!("Error running benchmark for {} nodes: {}", nodes, e);
+                    continue;
+                }
+            }
+        }
+
+        // Print network summary table
+        print_results_table(&network_results);
+        all_results.extend(network_results);
+    }
+
+    // Save results to JSON if specified
+    if let Some(output_file) = args.output {
+        save_results_json(&all_results, &output_file)?;
+        println!("\nResults saved to {}", output_file);
+    }
+
+    // Print final comparison
+    print_comparison_summary(&all_results);
+
+    Ok(())
+}
+
+async fn run_single_benchmark(args: SingleArgs) -> anyhow::Result<()> {
+    let network_config = match args.network.as_str() {
+        "best" => create_best_case_network(),
+        "worst" => create_worst_case_network(),
+        _ => return Err(anyhow::anyhow!("Invalid network type. Use 'best' or 'worst'")),
+    };
+
+    println!("Single Configuration Benchmark - True DKG");
+    println!("==========================================");
+    println!("Nodes: {}, Threshold: {:.1}%, Network: {}", 
+             args.nodes, args.threshold * 100.0, network_config.name);
+    println!("Using TRUE distributed key generation with bivariate polynomials");
+
+    let result = run_benchmark(args.nodes, args.threshold, network_config, args.iterations).await?;
+    
+    print_detailed_result(&result);
+
+    Ok(())
+}
+
+fn generate_comparison(_args: CompareArgs) -> anyhow::Result<()> {
+    // TODO: Implement comparison table generation from JSON
+    println!("Comparison generation not yet implemented");
+    Ok(())
+}
+
+fn print_single_result(result: &SimulationResults) {
+    println!("  {} nodes, {} threshold:", result.nodes, result.threshold);
+    println!("    DKG: {:.2}ms (CV: {:.1}%)", 
+             result.dkg_results.median_time_ms, result.dkg_results.cv_percent);
+    println!("    Signing: {:.2}ms (CV: {:.1}%)", 
+             result.signing_results.median_time_ms, result.signing_results.cv_percent);
+    println!("    Verification: {:.2}ms (CV: {:.1}%)", 
+             result.verification_results.median_time_ms, result.verification_results.cv_percent);
+    println!("    End-to-End: {:.2}ms (CV: {:.1}%)", 
+             result.end_to_end_results.median_time_ms, result.end_to_end_results.cv_percent);
+}
+
+fn print_detailed_result(result: &SimulationResults) {
+    println!("\nDetailed Results:");
+    println!("================");
+    
+    println!("\nDKG Phase:");
+    print_phase_details(&result.dkg_results);
+    
+    println!("\nSigning Phase:");
+    print_phase_details(&result.signing_results);
+    
+    println!("\nVerification Phase:");
+    print_phase_details(&result.verification_results);
+    
+    println!("\nEnd-to-End:");
+    print_phase_details(&result.end_to_end_results);
+}
+
+fn print_phase_details(phase: &PhaseResults) {
+    println!("  Samples: {}", phase.sample_count);
+    println!("  Median: {:.2}ms", phase.median_time_ms);
+    println!("  Mean: {:.2}ms", phase.mean_time_ms);
+    println!("  Std Dev: {:.2}ms", phase.std_dev_ms);
+    println!("  CV: {:.1}%", phase.cv_percent);
+    println!("  Range: {:.2}ms - {:.2}ms", phase.min_time_ms, phase.max_time_ms);
+}
+
+fn save_results_json(results: &[SimulationResults], filename: &str) -> anyhow::Result<()> {
+    let json = serde_json::to_string_pretty(results)?;
+    let mut file = File::create(filename)?;
+    file.write_all(json.as_bytes())?;
+    Ok(())
+}
+
+fn print_comparison_summary(results: &[SimulationResults]) {
+    println!("\n\nComparison Summary");
+    println!("==================");
+    
+    // Group results by network configuration
+    let mut best_case_results = Vec::new();
+    let mut worst_case_results = Vec::new();
+    
+    for result in results {
+        if result.network_config.contains("50ms") {
+            best_case_results.push(result);
+        } else {
+            worst_case_results.push(result);
+        }
+    }
+    
+    if !best_case_results.is_empty() {
+        println!("\nBest Case Network Performance:");
+        print_performance_summary(&best_case_results);
+    }
+    
+    if !worst_case_results.is_empty() {
+        println!("\nWorst Case Network Performance:");
+        print_performance_summary(&worst_case_results);
+    }
+    
+    // Network impact analysis
+    if !best_case_results.is_empty() && !worst_case_results.is_empty() {
+        print_network_impact_analysis(&best_case_results, &worst_case_results);
+    }
+}
+
+fn print_performance_summary(results: &[&SimulationResults]) {
+    println!("Nodes\tDKG (ms)\tSigning (ms)\tVerification (ms)\tEnd-to-End (ms)");
+    for result in results {
+        println!("{}\t{:.0}\t\t{:.0}\t\t{:.1}\t\t\t{:.0}",
+            result.nodes,
+            result.dkg_results.median_time_ms,
+            result.signing_results.median_time_ms,
+            result.verification_results.median_time_ms,
+            result.end_to_end_results.median_time_ms,
+        );
+    }
+}
+
+fn print_network_impact_analysis(best_case: &[&SimulationResults], worst_case: &[&SimulationResults]) {
+    println!("\nNetwork Impact Analysis:");
+    println!("========================");
+    println!("Nodes\tDKG Impact\tSigning Impact\tVerification Impact\tEnd-to-End Impact");
+    
+    for (best, worst) in best_case.iter().zip(worst_case.iter()) {
+        if best.nodes == worst.nodes {
+            let dkg_impact = ((worst.dkg_results.median_time_ms - best.dkg_results.median_time_ms) 
+                            / best.dkg_results.median_time_ms) * 100.0;
+            let signing_impact = ((worst.signing_results.median_time_ms - best.signing_results.median_time_ms) 
+                                / best.signing_results.median_time_ms) * 100.0;
+            let verification_impact = ((worst.verification_results.median_time_ms - best.verification_results.median_time_ms) 
+                                     / best.verification_results.median_time_ms) * 100.0;
+            let e2e_impact = ((worst.end_to_end_results.median_time_ms - best.end_to_end_results.median_time_ms) 
+                            / best.end_to_end_results.median_time_ms) * 100.0;
+            
+            println!("{}\t+{:.1}%\t\t+{:.1}%\t\t+{:.1}%\t\t\t+{:.1}%",
+                best.nodes, dkg_impact, signing_impact, verification_impact, e2e_impact);
+        }
+    }
+}
