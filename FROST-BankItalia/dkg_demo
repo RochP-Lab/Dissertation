@@ -1,0 +1,545 @@
+ **Distributed Key Generation (DKG)** (this file):
+ * - No single entity knows the complete secret key
+ * - Participants jointly generate key shares through cryptographic protocol
+ * - More complex implementation, slower setup
+ * - No trusted party required during key generation
+ * - Enhanced security through distributed trust
+ *
+ * DKG Protocol Phases:
+ * 
+ * **Phase 1 - Commitment Generation**:
+ * Each participant i:
+ * 1. Generates random polynomial coefficients (secret shares)
+ * 2. Creates Verifiable Secret Sharing (VSS) commitments to coefficients
+ * 3. Generates zero-knowledge proofs of coefficient knowledge
+ * 4. Broadcasts commitments and proofs to all other participants
+ *
+ * **Phase 2 - Commitment Validation**:
+ * Each participant:
+ * 1. Receives commitments and ZK proofs from all other participants
+ * 2. Validates each peer's zero-knowledge proof
+ * 3. Verifies VSS commitment integrity
+ * 4. Marks valid participants for inclusion in final key generation
+ *
+ * **Phase 3 - Share Distribution & Finalization**:
+ * Each participant:
+ * 1. Distributes their secret shares to intended recipients
+ * 2. Receives secret shares from all valid participants
+ * 3. Combines shares to generate final keypair
+ * 4. Derives group public key from aggregated commitments
+ *
+ * Key API Components Demonstrated:
+ * 
+ * 1. **DKG Initialization**:
+ *    - secp256k1_frost_vss_commitments_create() - Allocate commitment storage
+ *    - Context creation for signing operations
+ *    - DKG context string for protocol binding
+ *
+ * 2. **Phase 1 - Commitment Generation**:
+ *    - secp256k1_frost_keygen_dkg_begin() - Generate coefficients and commitments
+ *    - Creates secret shares for all participants
+ *    - Generates VSS commitments and zero-knowledge proofs
+ *    - Returns shares to be distributed after validation
+ *
+ * 3. **Phase 2 - Commitment Validation**:
+ *    - secp256k1_frost_keygen_dkg_commitment_validate() - Verify peer commitments
+ *    - Validates zero-knowledge proofs of secret knowledge
+ *    - Ensures cryptographic integrity of VSS commitments
+ *    - Marks commitments as valid for finalization phase
+ *
+ * 4. **Phase 3 - Key Finalization**:
+ *    - secp256k1_frost_keygen_dkg_finalize() - Complete key generation
+ *    - Combines secret shares from all valid participants
+ *    - Generates final threshold keypair for participant
+ *    - Derives group public key for signature verification
+ *
+ * 5. **Signing Protocol** (identical to trusted dealer):
+ *    - Two-round FROST signing protocol
+ *    - Nonce generation and commitment exchange
+ *    - Partial signature creation and aggregation
+ *
+ * 6. **Verification**:
+ *    - Standard Schnorr signature verification
+ *    - Uses group public key derived from DKG
+ *
+ * Security Properties:
+ * - No single party ever knows the complete secret key
+ * - Threshold t participants needed to sign (t-of-n security)
+ * - Verifiable secret sharing prevents dishonest participants
+ * - Zero-knowledge proofs ensure cryptographic integrity
+ * - Forward security and unforgeability properties preserved
+ *
+ * Example Configuration:
+ * - 2-of-3 threshold scheme
+ * - Message: "Hello DKG World!"
+ * - Curve: secp256k1 (Bitcoin/Ethereum curve)
+ * - DKG context: "frost_dkg_demo" for protocol binding
+ *
+ * Network Communication Simulation:
+ * This demo simulates a distributed protocol by:
+ * 1. Running each participant's DKG phase sequentially
+ * 2. Storing intermediate results in shared data structures
+ * 3. Distributing shares through simulated message passing
+ * 4. Validating all commitments before proceeding to finalization
+ *
+ * In real deployment, these operations would occur across network boundaries
+ * with proper authentication, encryption, and fault tolerance mechanisms.
+ */
+
+#include <stdio.h>
+#include <assert.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include <secp256k1.h>
+#include <secp256k1_frost.h>
+
+#include "examples_util.h"
+
+/* Configuration constants for 2-of-3 threshold scheme */
+#define EXAMPLE_MAX_PARTICIPANTS 3
+#define EXAMPLE_MIN_PARTICIPANTS 2
+
+/* DKG context string - binds protocol execution to specific application */
+#define DKG_CONTEXT "frost_dkg_demo"
+#define DKG_CONTEXT_LEN 15
+
+/*
+ * Utility function to print hex-encoded data for educational purposes
+ * Helps visualize the cryptographic material being generated and exchanged
+ */
+static void print_hex_labeled(const char* label, const unsigned char* data, size_t len) {
+    size_t i;
+    printf("  %s: 0x", label);
+    for (i = 0; i < len; i++) {
+        printf("%02x", data[i]);
+    }
+    printf("\n");
+}
+
+/*
+ * Extract and display the secret key share from a FROST keypair
+ * Educational function to show the actual cryptographic material
+ * In production, secret keys should never be displayed or logged
+ */
+static void print_keypair_info(const char* participant_label, const secp256k1_frost_keypair* keypair) {
+    unsigned char seckey[32];
+    unsigned char pubkey[64];
+    
+    printf("  %s:\n", participant_label);
+    
+    /* Extract secret key for display (NEVER do this in production!) */
+    /* This is for educational purposes only to show the DKG result */
+    memcpy(seckey, keypair->secret, 32);
+    print_hex_labeled("    Secret Key Share", seckey, 32);
+    
+    /* Extract and display public key */
+    memcpy(pubkey, keypair->public_keys.public_key, 64);
+    print_hex_labeled("    Public Key", pubkey, 64);
+}
+
+int main(void) {
+    /* Message to be signed using the DKG-generated keys */
+    unsigned char msg[] = "Hello DKG World!";
+    unsigned char msg_hash[32];
+    unsigned char tag[] = "frost_dkg_protocol";
+    uint32_t participant_idx, share_idx;
+    unsigned char binding_seed[32] = {0};
+    unsigned char hiding_seed[32] = {0};
+    unsigned char signature[64];
+    int is_signature_valid;
+    int return_val;
+    
+    /* secp256k1 context for signing and verification operations */
+    secp256k1_context *sign_verify_ctx;
+    
+    /* Storage for each participant's VSS commitments and ZK proofs */
+    secp256k1_frost_vss_commitments* dkg_commitments[EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Storage for secret shares generated by each participant */
+    /* all_shares[i] contains shares generated by participant i */
+    secp256k1_frost_keygen_secret_share all_shares[EXAMPLE_MAX_PARTICIPANTS][EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Simulate share distribution: collect shares intended for each participant */
+    /* participant_shares[i] contains all shares intended for participant i */
+    secp256k1_frost_keygen_secret_share participant_shares[EXAMPLE_MAX_PARTICIPANTS][EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Final keypairs for each participant */
+    secp256k1_frost_keypair participant_keypairs[EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Extract public keys from keypairs for signing operations */
+    secp256k1_frost_pubkey public_keys[EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Display the group public key (same for all participants) */
+    unsigned char group_pubkey[64];
+    
+    /* Storage for signing protocol */
+    secp256k1_frost_signature_share signature_shares[EXAMPLE_MAX_PARTICIPANTS];
+    secp256k1_frost_nonce *nonces[EXAMPLE_MAX_PARTICIPANTS];
+    secp256k1_frost_nonce_commitment signing_commitments[EXAMPLE_MAX_PARTICIPANTS];
+    
+    /* Extract group public key for verification */
+    secp256k1_frost_pubkey group_pubkey_frost;
+    
+    /* Loop variables */
+    uint32_t generator_idx;
+    uint32_t peer_idx;
+
+    printf("=== FROST Distributed Key Generation (DKG) Demo ===\n");
+    printf("Message to sign: \"%s\"\n", msg);
+    printf("Threshold scheme: %d-of-%d participants\n", 
+           EXAMPLE_MIN_PARTICIPANTS, EXAMPLE_MAX_PARTICIPANTS);
+    printf("DKG Protocol: No trusted dealer required\n\n");
+
+    /* Initialize secp256k1 context for signing and verification operations */
+    sign_verify_ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /*
+     * DKG Phase 1: Commitment Generation
+     * ==================================
+     * Each participant generates:
+     * - Random polynomial coefficients (threshold-1 degree)
+     * - Verifiable Secret Sharing (VSS) commitments
+     * - Zero-knowledge proofs of coefficient knowledge
+     * - Secret shares for all participants (including themselves)
+     */
+    
+    printf("=== DKG Phase 1: Commitment Generation ===\n");
+    
+    /* Initialize commitment storage for each participant */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        dkg_commitments[participant_idx] = secp256k1_frost_vss_commitments_create(EXAMPLE_MIN_PARTICIPANTS);
+        if (dkg_commitments[participant_idx] == NULL) {
+            printf("Failed to create VSS commitments for participant %d\n", participant_idx);
+            return 1;
+        }
+    }
+
+    /* Each participant runs DKG begin phase */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        printf("Participant #%d generating commitments and shares...\n", participant_idx);
+        
+        /*
+         * secp256k1_frost_keygen_dkg_begin() performs the following:
+         * 1. Generates random polynomial of degree (threshold-1)
+         * 2. Creates VSS commitments to polynomial coefficients
+         * 3. Generates zero-knowledge proof of secret coefficient knowledge
+         * 4. Evaluates polynomial at each participant's index to create shares
+         * 5. Returns shares array and commitment structure
+         * 
+         * Parameters:
+         * - ctx: secp256k1 context for cryptographic operations
+         * - dkg_commitment: output structure for VSS commitments and ZK proof
+         * - shares: output array of secret shares for all participants
+         * - num_participants: total number of participants (n in t-of-n)
+         * - threshold: minimum participants needed to sign (t in t-of-n)
+         * - generator_index: this participant's index (1-based)
+         * - context: DKG protocol context string for binding
+         * - context_length: length of context string
+         */
+        return_val = secp256k1_frost_keygen_dkg_begin(
+            sign_verify_ctx,
+            dkg_commitments[participant_idx],
+            all_shares[participant_idx],
+            EXAMPLE_MAX_PARTICIPANTS,
+            EXAMPLE_MIN_PARTICIPANTS,
+            participant_idx + 1,  /* 1-based indexing */
+            (const unsigned char*)DKG_CONTEXT,
+            DKG_CONTEXT_LEN
+        );
+        
+        if (return_val != 1) {
+            printf("DKG begin failed for participant %d\n", participant_idx);
+            return 1;
+        }
+    }
+
+    /*
+     * DKG Phase 2: Commitment Validation
+     * ==================================
+     * Each participant validates commitments received from all other participants.
+     * This ensures cryptographic integrity before proceeding to share distribution.
+     */
+    
+    printf("\n=== DKG Phase 2: Commitment Validation ===\n");
+    
+    /* Each participant validates all commitments (including their own) */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        printf("Participant #%d validating all commitments...\n", participant_idx);
+        
+        /* Validate each peer's commitment */
+        for (peer_idx = 0; peer_idx < EXAMPLE_MAX_PARTICIPANTS; peer_idx++) {
+            /*
+             * secp256k1_frost_keygen_dkg_commitment_validate() performs:
+             * 1. Verifies zero-knowledge proof of secret coefficient knowledge
+             * 2. Validates VSS commitment structure integrity
+             * 3. Checks commitment format and cryptographic consistency
+             * 4. Marks commitment as verified for use in finalization
+             * 
+             * Parameters:
+             * - ctx: secp256k1 context for verification operations
+             * - peer_commitment: commitment structure to validate
+             * - context: DKG protocol context string (must match begin phase)
+             * - context_length: length of context string
+             */
+            return_val = secp256k1_frost_keygen_dkg_commitment_validate(
+                sign_verify_ctx,
+                dkg_commitments[peer_idx],
+                (const unsigned char*)DKG_CONTEXT,
+                DKG_CONTEXT_LEN
+            );
+            
+            if (return_val != 1) {
+                printf("Commitment validation failed for peer %d\n", peer_idx);
+                return 1;
+            }
+        }
+    }
+
+    /*
+     * DKG Phase 3: Share Distribution and Key Finalization
+     * ====================================================
+     * Now that all commitments are validated, participants can safely
+     * distribute their secret shares and complete key generation.
+     */
+    
+    printf("\n=== DKG Phase 3: Share Distribution and Finalization ===\n");
+    
+    printf("Distributing secret shares among participants...\n");
+    
+    /* Distribute shares from each generator to intended recipients */
+    for (generator_idx = 0; generator_idx < EXAMPLE_MAX_PARTICIPANTS; generator_idx++) {
+        for (share_idx = 0; share_idx < EXAMPLE_MAX_PARTICIPANTS; share_idx++) {
+            /* Get the intended recipient index (1-based in the share structure) */
+            uint32_t recipient_idx = all_shares[generator_idx][share_idx].receiver_index - 1;
+            
+            /* Copy share to recipient's collection */
+            participant_shares[recipient_idx][generator_idx] = 
+                all_shares[generator_idx][share_idx];
+        }
+    }
+    
+    printf("Distributing secret shares among participants...\n");
+
+    /* Each participant finalizes their key generation */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        printf("Participant #%d finalizing key generation...\n", participant_idx);
+        
+        /*
+         * secp256k1_frost_keygen_dkg_finalize() performs:
+         * 1. Combines secret shares from all participants using Lagrange interpolation
+         * 2. Verifies share consistency against VSS commitments
+         * 3. Generates final secret key share for this participant
+         * 4. Computes corresponding public key
+         * 5. Derives group public key from aggregated commitments
+         * 
+         * Parameters:
+         * - ctx: secp256k1 context for cryptographic operations
+         * - keypair: output keypair structure for this participant
+         * - index: this participant's index (1-based)
+         * - num_participants: total number of participants
+         * - shares: array of secret shares received from all participants
+         * - commitments: array of validated VSS commitments from all participants
+         */
+        return_val = secp256k1_frost_keygen_dkg_finalize(
+            sign_verify_ctx,
+            &participant_keypairs[participant_idx],
+            participant_idx + 1,  /* 1-based indexing */
+            EXAMPLE_MAX_PARTICIPANTS,
+            participant_shares[participant_idx],
+            dkg_commitments
+        );
+        
+        if (return_val != 1) {
+            printf("DKG finalization failed for participant %d\n", participant_idx);
+            return 1;
+        }
+    }
+
+    /* Extract public keys from keypairs for signing operations */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MIN_PARTICIPANTS; participant_idx++) {
+        secp256k1_frost_pubkey_from_keypair(&public_keys[participant_idx], 
+                                           &participant_keypairs[participant_idx]);
+    }
+
+    printf("\n=== DKG Results: Generated Cryptographic Material ===\n");
+    
+    /* Display the group public key (same for all participants) */
+    memcpy(group_pubkey, participant_keypairs[0].public_keys.group_public_key, 64);
+    print_hex_labeled("Group Public Key", group_pubkey, 64);
+    
+    printf("\nIndividual Participant Keys:\n");
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        char participant_label[32];
+        sprintf(participant_label, "Participant #%d", participant_idx);
+        print_keypair_info(participant_label, &participant_keypairs[participant_idx]);
+    }
+
+    /*
+     * FROST Signing Phase
+     * ===================
+     * Now we use the DKG-generated keys to create a threshold signature.
+     * This phase is identical to the trusted dealer approach.
+     */
+    
+    printf("\n=== FROST Signing Protocol ===\n");
+    printf("Using DKG-generated keys for threshold signing...\n");
+    
+    /*
+     * Round 1: Nonce Generation and Commitment Exchange
+     * Each participant generates secret nonces and commits to them
+     */
+    printf("Round 1: Generating nonces and commitments...\n");
+    
+    for (participant_idx = 0; participant_idx < EXAMPLE_MIN_PARTICIPANTS; participant_idx++) {
+        /* Generate randomness for nonce creation */
+        if (!fill_random(binding_seed, sizeof(binding_seed))) {
+            printf("Failed to generate binding_seed for participant %d\n", participant_idx);
+            return 1;
+        }
+        if (!fill_random(hiding_seed, sizeof(hiding_seed))) {
+            printf("Failed to generate hiding_seed for participant %d\n", participant_idx);
+            return 1;
+        }
+
+        /* Create nonce and commitment for this participant */
+        nonces[participant_idx] = secp256k1_frost_nonce_create(
+            sign_verify_ctx, 
+            &participant_keypairs[participant_idx],
+            binding_seed, 
+            hiding_seed
+        );
+        
+        if (nonces[participant_idx] == NULL) {
+            printf("Failed to create nonce for participant %d\n", participant_idx);
+            return 1;
+        }
+        
+        /* Extract commitment for sharing with other participants */
+        memcpy(&signing_commitments[participant_idx], 
+               &(nonces[participant_idx]->commitments), 
+               sizeof(secp256k1_frost_nonce_commitment));
+    }
+
+    /* Hash the message for signing (standard practice for long messages) */
+    return_val = secp256k1_tagged_sha256(sign_verify_ctx, msg_hash, tag, sizeof(tag)-1, msg, strlen((char*)msg));
+    if (return_val != 1) {
+        printf("Failed to hash message\n");
+        return 1;
+    }
+
+    /*
+     * Round 2: Partial Signature Creation and Aggregation
+     * Each participant creates a signature share using their secret key and nonce
+     */
+    printf("Round 2: Creating partial signatures...\n");
+    
+    for (participant_idx = 0; participant_idx < EXAMPLE_MIN_PARTICIPANTS; participant_idx++) {
+        /*
+         * secp256k1_frost_sign() creates a partial signature share:
+         * 1. Combines participant's secret key share with nonce
+         * 2. Incorporates message hash and other participants' nonce commitments
+         * 3. Produces signature share that can be aggregated with others
+         * 
+         * The signature share is cryptographically bound to:
+         * - The message being signed
+         * - This participant's secret key share
+         * - This participant's nonce
+         * - All other participants' nonce commitments
+         */
+        return_val = secp256k1_frost_sign(
+            sign_verify_ctx, 
+            &(signature_shares[participant_idx]),
+            msg_hash, 
+            EXAMPLE_MIN_PARTICIPANTS,
+            &participant_keypairs[participant_idx],
+            nonces[participant_idx],
+            signing_commitments
+        );
+        
+        if (return_val != 1) {
+            printf("Failed to create signature share for participant %d\n", participant_idx);
+            return 1;
+        }
+    }
+
+    /* Aggregate partial signatures into final FROST signature */
+    printf("Aggregating partial signatures...\n");
+    return_val = secp256k1_frost_aggregate(
+        sign_verify_ctx, 
+        signature, 
+        msg_hash,
+        &participant_keypairs[0],
+        public_keys, 
+        signing_commitments,
+        signature_shares, 
+        EXAMPLE_MIN_PARTICIPANTS
+    );
+    
+    if (return_val != 1) {
+        printf("Failed to aggregate signature shares\n");
+        return 1;
+    }
+    
+    print_hex_labeled("Generated Signature", signature, 64);
+
+    /*
+     * Signature Verification
+     * ======================
+     * Verify the signature using the group public key.
+     * This uses the FROST verification function.
+     */
+    
+    printf("\n=== Signature Verification ===\n");
+    
+    /* Extract group public key for verification */
+    if (!secp256k1_frost_pubkey_from_keypair(&group_pubkey_frost, &participant_keypairs[0])) {
+        printf("Failed to extract group public key\n");
+        return 1;
+    }
+
+    /* Verify the signature using FROST verification */
+    is_signature_valid = secp256k1_frost_verify(sign_verify_ctx, signature, msg_hash, &group_pubkey_frost);
+    
+    if (is_signature_valid) {
+        printf("Is the signature valid? ✅ YES - Signature verified successfully!\n");
+        printf("\nDKG Protocol completed successfully!\n");
+        printf("   - No trusted dealer was required\n");
+        printf("   - All participants contributed to key generation\n");
+        printf("   - Threshold signature created and verified\n");
+    } else {
+        printf("Is the signature valid? ❌ NO - Signature verification failed!\n");
+        return 1;
+    }
+
+    /*
+     * Cleanup
+     * =======
+     * Free allocated memory and destroy sensitive data
+     */
+    
+    /* Cleanup nonces */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MIN_PARTICIPANTS; participant_idx++) {
+        if (nonces[participant_idx] != NULL) {
+            secp256k1_frost_nonce_destroy(nonces[participant_idx]);
+        }
+    }
+    
+    /* Cleanup VSS commitments */
+    for (participant_idx = 0; participant_idx < EXAMPLE_MAX_PARTICIPANTS; participant_idx++) {
+        if (dkg_commitments[participant_idx] != NULL) {
+            secp256k1_frost_vss_commitments_destroy(dkg_commitments[participant_idx]);
+        }
+    }
+    
+    /* Cleanup context */
+    secp256k1_context_destroy(sign_verify_ctx);
+    
+    printf("\n=== Demo Complete ===\n");
+    printf("This demo showed how FROST DKG enables threshold signatures\n");
+    printf("without requiring any trusted dealer during key generation.\n");
+    
+    return 0;
+}
